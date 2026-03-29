@@ -5,55 +5,130 @@
 #include <dxgi1_2.h>
 #include <d3d11.h>
 
+#include "NetworkManager.h"
+
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dxgi.lib")
+#pragma comment(lib, "winhttp.lib")
+
+#define SERVER_HOST L"192.168.88.127"
+#define SERVER_PORT 8000
+#define AGENT_ID L"agent1"
 
 int main() {
-    // 1. Открываем рабочий стол
+    wprintf(L"=== SysdmAgent Starting ===\n");
+
     HDESK hDesk = OpenInputDesktop(0, FALSE, GENERIC_ALL);
-    if (!hDesk) return 1;
+    if (!hDesk) {
+        wprintf(L"Failed to open input desktop\n");
+        return 1;
+    }
     SetThreadDesktop(hDesk);
     CloseDesktop(hDesk);
 
-    // 2. Создаём D3D устройство
     ID3D11Device* device = nullptr;
     ID3D11DeviceContext* ctx = nullptr;
     D3D_FEATURE_LEVEL level;
     HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0,
         nullptr, 0, D3D11_SDK_VERSION, &device, &level, &ctx);
-    if (FAILED(hr)) return 1;
+    if (FAILED(hr)) {
+        wprintf(L"Failed to create D3D device\n");
+        return 1;
+    }
 
-    // 3. Получаем DXGI adapter
     IDXGIDevice* dxgiDevice = nullptr;
     device->QueryInterface(__uuidof(IDXGIDevice), (void**)&dxgiDevice);
     IDXGIAdapter* adapter = nullptr;
     dxgiDevice->GetParent(__uuidof(IDXGIAdapter), (void**)&adapter);
     dxgiDevice->Release();
 
-    // 4. Получаем первый вывод (монитор)
     IDXGIOutput* output = nullptr;
     adapter->EnumOutputs(0, &output);
     adapter->Release();
 
-    // 5. Получаем IDXGIOutput1
     IDXGIOutput1* output1 = nullptr;
     output->QueryInterface(__uuidof(IDXGIOutput1), (void**)&output1);
     output->Release();
 
-    // 6. Создаём дубликат экрана
     IDXGIOutputDuplication* dup = nullptr;
     hr = output1->DuplicateOutput(device, &dup);
     output1->Release();
-    if (FAILED(hr)) return 1;
+    if (FAILED(hr)) {
+        wprintf(L"Failed to create duplication: 0x%08X\n", hr);
+        device->Release();
+        return 1;
+    }
 
-    // 7. Цикл захвата
-    while (true) {
+    NetworkManager network;
+    std::wstring wsPath = std::wstring(L"/ws/agent/") + AGENT_ID;
+    
+    network.SetMessageCallback([&](const std::string& msg) {
+        wprintf(L"[WS] Received: %S\n", msg.c_str());
+    });
+    
+    network.SetStateCallback([&](WebSocketState state) {
+        switch (state) {
+            case WebSocketState::Connected:
+                wprintf(L"[WS] Connected!\n");
+                network.SendText("{\"type\":\"ping\"}");
+                break;
+            case WebSocketState::Disconnected:
+                wprintf(L"[WS] Disconnected\n");
+                break;
+            case WebSocketState::Error:
+                wprintf(L"[WS] Error\n");
+                break;
+            default:
+                break;
+        }
+    });
+
+    wprintf(L"Connecting to %s:%d%s...\n", SERVER_HOST, SERVER_PORT, wsPath.c_str());
+    
+    if (!network.Connect(SERVER_HOST, SERVER_PORT, wsPath)) {
+        wprintf(L"Failed to connect\n");
+        dup->Release();
+        ctx->Release();
+        device->Release();
+        return 1;
+    }
+
+    int frameCount = 0;
+    bool running = true;
+
+    wprintf(L"Starting capture loop...\n");
+
+    while (running) {
         DXGI_OUTDUPL_FRAME_INFO info;
         IDXGIResource* res = nullptr;
 
         hr = dup->AcquireNextFrame(16, &info, &res);
-        if (hr == DXGI_ERROR_WAIT_TIMEOUT) continue;
-        if (FAILED(hr)) break;
+        
+        if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
+            continue;
+        }
+        
+        if (hr == DXGI_ERROR_ACCESS_LOST) {
+            wprintf(L"Access lost, reinitializing...\n");
+            dup->Release();
+            
+            IDXGIOutput1* output1 = nullptr;
+            device->QueryInterface(__uuidof(IDXGIDevice), (void**)&dxgiDevice);
+            dxgiDevice->GetParent(__uuidof(IDXGIAdapter), (void**)&adapter);
+            dxgiDevice->Release();
+            adapter->EnumOutputs(0, &output);
+            adapter->Release();
+            output->QueryInterface(__uuidof(IDXGIOutput1), (void**)&output1);
+            output->Release();
+            output1->DuplicateOutput(device, &dup);
+            output1->Release();
+            continue;
+        }
+        
+        if (FAILED(hr)) {
+            wprintf(L"AcquireNextFrame failed: 0x%08X\n", hr);
+            break;
+        }
 
         if (info.LastPresentTime.QuadPart != 0) {
             ID3D11Texture2D* tex = nullptr;
@@ -63,16 +138,26 @@ int main() {
             if (tex) {
                 D3D11_TEXTURE2D_DESC desc;
                 tex->GetDesc(&desc);
-                printf("Frame: %dx%d\n", desc.Width, desc.Height);
+                
+                if (frameCount % 60 == 0) {
+                    wprintf(L"Frame #%d: %dx%d\n", frameCount, desc.Width, desc.Height);
+                }
+                
                 tex->Release();
             }
         }
+        
         dup->ReleaseFrame();
-        Sleep(10);
+        frameCount++;
+
+        Sleep(16);
     }
 
+    network.Disconnect();
     dup->Release();
     ctx->Release();
     device->Release();
+
+    wprintf(L"Agent stopped.\n");
     return 0;
 }
