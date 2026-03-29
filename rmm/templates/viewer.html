@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>RMM Viewer</title>
+    <style>
+        body { margin: 0; background: #000; }
+        canvas { display: block; width: 100vw; height: 100vh; }
+        #fps { position: fixed; top: 10px; left: 10px; color: #0f0; font: 16px monospace; }
+        #status { position: fixed; top: 40px; left: 10px; color: #0f0; font: 14px monospace; }
+    </style>
+</head>
+<body>
+    <canvas id="canvas"></canvas>
+    <div id="fps">FPS: 0</div>
+    <div id="status">Connecting...</div>
+
+    <script>
+        const canvas = document.getElementById('canvas');
+        const ctx = canvas.getContext('2d');
+        const fpsEl = document.getElementById('fps');
+        const statusEl = document.getElementById('status');
+        
+        let ws = null;
+        let frameCount = 0;
+        let lastFpsTime = Date.now();
+        let fps = 0;
+
+        function connect() {
+            statusEl.textContent = 'Connecting...';
+            
+            ws = new WebSocket(`ws://${window.location.host}/ws/viewer/agent1`);
+            
+            ws.binaryType = 'arraybuffer';
+            
+            ws.onopen = () => {
+                statusEl.textContent = 'Connected';
+                console.log('WebSocket connected');
+            };
+            
+            ws.onmessage = async (e) => {
+                if (e.data instanceof ArrayBuffer) {
+                    const buf = e.data;
+                    const view = new DataView(buf);
+                    
+                    const width = view.getInt32(0, true);
+                    const height = view.getInt32(4, true);
+                    const timestamp = view.getFloat64(8, true);
+                    const rgbData = new Uint8Array(buf, 16);
+                    
+                    if (canvas.width !== width || canvas.height !== height) {
+                        canvas.width = width;
+                        canvas.height = height;
+                        console.log(`Canvas resized: ${width}x${height}`);
+                    }
+                    
+                    const imageData = ctx.createImageData(width, height);
+                    
+                    for (let i = 0; i < rgbData.length; i += 3) {
+                        const j = i;
+                        imageData.data[j] = rgbData[i];
+                        imageData.data[j + 1] = rgbData[i + 1];
+                        imageData.data[j + 2] = rgbData[i + 2];
+                        imageData.data[j + 3] = 255;
+                    }
+                    
+                    ctx.putImageData(imageData, 0, 0);
+                    
+                    frameCount++;
+                    const now = Date.now();
+                    if (now - lastFpsTime >= 1000) {
+                        fps = frameCount;
+                        frameCount = 0;
+                        lastFpsTime = now;
+                        fpsEl.textContent = `FPS: ${fps}`;
+                    }
+                } else {
+                    console.log('Text message:', e.data);
+                }
+            };
+            
+            ws.onclose = () => {
+                statusEl.textContent = 'Disconnected - reconnecting...';
+                setTimeout(connect, 2000);
+            };
+            
+            ws.onerror = (err) => {
+                console.error('WebSocket error:', err);
+                statusEl.textContent = 'Error';
+            };
+        }
+        
+        connect();
+    </script>
+</body>
+</html>

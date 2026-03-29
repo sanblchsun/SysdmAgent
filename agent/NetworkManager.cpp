@@ -153,6 +153,20 @@ void NetworkManager::ReceiveLoop() {
                 std::string msg((char*)buffer, bytesRead);
                 cb(msg);
             }
+        } else if (msgType == WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE) {
+            EnterCriticalSection(&cs);
+            VideoCallback cb = onVideo;
+            LeaveCriticalSection(&cs);
+            
+            if (cb && bytesRead > 8) {
+                VideoFrame frame;
+                frame.width = *(int*)buffer;
+                frame.height = *(int*)(buffer + 4);
+                frame.timestamp = *(double*)(buffer + 8);
+                frame.data.resize(bytesRead - 16);
+                memcpy(frame.data.data(), buffer + 16, bytesRead - 16);
+                cb(frame);
+            }
         }
     }
     
@@ -195,20 +209,35 @@ void NetworkManager::Disconnect() {
 }
 
 bool NetworkManager::SendText(const std::string& message) {
+    return SendBinary((const uint8_t*)message.c_str(), message.length());
+}
+
+bool NetworkManager::SendBinary(const uint8_t* data, size_t len) {
     EnterCriticalSection(&cs);
     bool canSend = (state == WebSocketState::Connected && hRequest != nullptr);
     LeaveCriticalSection(&cs);
     
     if (!canSend) return false;
 
-    HRESULT hr = WinHttpWebSocketSend(hRequest, WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE, 
-        (PVOID)message.c_str(), (DWORD)message.length());
+    HRESULT hr = WinHttpWebSocketSend(hRequest, WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE, 
+        (PVOID)data, (DWORD)len);
     
     if (FAILED(hr)) {
         Log(L"[WS] Send failed: 0x%08X", hr);
         return false;
     }
     return true;
+}
+
+bool NetworkManager::SendVideoFrame(const VideoFrame& frame) {
+    std::vector<uint8_t> buffer(16 + frame.data.size());
+    
+    *(int*)buffer.data() = frame.width;
+    *(int*)(buffer.data() + 4) = frame.height;
+    *(double*)(buffer.data() + 8) = frame.timestamp;
+    memcpy(buffer.data() + 16, frame.data.data(), frame.data.size());
+    
+    return SendBinary(buffer.data(), buffer.size());
 }
 
 void NetworkManager::ProcessEvents() {
