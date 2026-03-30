@@ -227,7 +227,13 @@ bool NetworkManager::SendText(const std::string& message) {
         Log(L"[WS] SendText failed: 0x%08X", hr);
         return false;
     }
-    return true;
+    
+    DWORD bytesRead = 0;
+    WINHTTP_WEB_SOCKET_BUFFER_TYPE respType;
+    uint8_t respBuffer[128];
+    hr = WinHttpWebSocketReceive(hRequest, respBuffer, sizeof(respBuffer), &bytesRead, &respType);
+    
+    return SUCCEEDED(hr);
 }
 
 bool NetworkManager::SendBinary(const uint8_t* data, size_t len) {
@@ -236,12 +242,10 @@ bool NetworkManager::SendBinary(const uint8_t* data, size_t len) {
     LeaveCriticalSection(&cs);
     
     if (!canSend) {
-        Log(L"[WS] SendBinary: not connected (state=%d, hRequest=%p)", (int)state, hRequest);
+        Log(L"[WS] SendBinary: not connected");
         return false;
     }
 
-    Log(L"[WS] SendBinary: %d bytes...", len);
-    
     HRESULT hr = WinHttpWebSocketSend(hRequest, WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE, 
         (PVOID)data, (DWORD)len);
     
@@ -250,7 +254,6 @@ bool NetworkManager::SendBinary(const uint8_t* data, size_t len) {
         return false;
     }
     
-    Log(L"[WS] SendBinary: sent %d bytes", len);
     return true;
 }
 
@@ -262,9 +265,10 @@ bool NetworkManager::SendVideoFrame(const VideoFrame& frame) {
     *(double*)(buffer.data() + 8) = frame.timestamp;
     memcpy(buffer.data() + 16, frame.data.data(), frame.data.size());
     
-    Log(L"[WS] SendVideoFrame: %dx%d, %d bytes total", frame.width, frame.height, buffer.size());
+    bool result = SendBinary(buffer.data(), buffer.size());
+    Log(L"[WS] SendVideoFrame: %dx%d, %d bytes, result=%d", frame.width, frame.height, buffer.size(), result);
     
-    return SendBinary(buffer.data(), buffer.size());
+    return result;
 }
 
 void NetworkManager::ProcessEvents() {
