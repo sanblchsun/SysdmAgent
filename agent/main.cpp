@@ -5,6 +5,7 @@
 #include <dxgi1_2.h>
 #include <d3d11.h>
 #include <gdiplus.h>
+#include <objbase.h>
 
 #include "NetworkManager.h"
 
@@ -54,8 +55,13 @@ public:
             }
         }
         
+        HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, 0);
+        if (!hMem) return false;
+        
         IStream* stream = NULL;
-        if (CreateStreamOnHGlobal(NULL, TRUE, &stream) != S_OK) {
+        HRESULT hr = CreateStreamOnHGlobal(hMem, FALSE, &stream);
+        if (FAILED(hr)) {
+            GlobalFree(hMem);
             return false;
         }
         
@@ -67,25 +73,22 @@ public:
         params.Parameter[0].Guid = EncoderQuality;
         params.Parameter[0].Type = EncoderParameterValueTypeLong;
         params.Parameter[0].NumberOfValues = 1;
-        params.Parameter[0].Value = &JPEG_QUALITY;
+        ULONG quality = JPEG_QUALITY;
+        params.Parameter[0].Value = &quality;
         
         Status st = bitmap.Save(stream, &jpgClsid, &params);
+        
+        if (st == Ok) {
+            SIZE_T size = GlobalSize(hMem);
+            void* data = GlobalLock(hMem);
+            if (data) {
+                jpegOut.assign((uint8_t*)data, (uint8_t*)data + size);
+                GlobalUnlock(hMem);
+            }
+        }
+        
         stream->Release();
-        
-        if (st != Ok) {
-            return false;
-        }
-        
-        HGLOBAL hGlobal = NULL;
-        stream->GetHGlobal(&hGlobal);
-        if (!hGlobal) return false;
-        
-        SIZE_T size = GlobalSize(hGlobal);
-        void* data = GlobalLock(hGlobal);
-        if (data) {
-            jpegOut.assign((uint8_t*)data, (uint8_t*)data + size);
-            GlobalUnlock(hGlobal);
-        }
+        GlobalFree(hMem);
         
         return !jpegOut.empty();
     }
@@ -331,7 +334,7 @@ int main() {
                             
                             bool sent = network.SendVideoFrame(frame);
                             if (frameCount <= 3) {
-                                wprintf(L"  JPEG: %d bytes, sent=%d\n", jpegData.size(), sent);
+                                wprintf(L"  JPEG: %zdb, sent=%d\n", jpegData.size(), sent);
                             }
                         }
                         
