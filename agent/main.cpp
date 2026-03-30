@@ -108,16 +108,17 @@ int main() {
     int frameCount = 0;
     int64_t lastFrameTime = 0;
     int64_t frameInterval = 1000 / VIDEO_FPS;
+    bool firstFrame = true;
 
     wprintf(L"Starting capture loop (%d FPS)...\n", VIDEO_FPS);
 
     while (network.GetState() == WebSocketState::Connected) {
         int64_t now = GetTickCount64();
         
-        DXGI_OUTDUPL_FRAME_INFO info;
+        DXGI_OUTDUPL_FRAME_INFO info = {};
         IDXGIResource* res = nullptr;
 
-        hr = dup->AcquireNextFrame(16, &info, &res);
+        hr = dup->AcquireNextFrame(1000, &info, &res);
         
         if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
             continue;
@@ -144,6 +145,8 @@ int main() {
             break;
         }
 
+        frameCount++;
+        
         if (info.LastPresentTime.QuadPart != 0) {
             ID3D11Texture2D* tex = nullptr;
             res->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&tex);
@@ -153,11 +156,18 @@ int main() {
                 D3D11_TEXTURE2D_DESC desc;
                 tex->GetDesc(&desc);
                 
-                if (frameCount % 60 == 0) {
-                    wprintf(L"Frame #%d: %dx%d\n", frameCount, desc.Width, desc.Height);
+                bool timeToSend = (now - lastFrameTime >= frameInterval) || firstFrame;
+                
+                if (firstFrame || frameCount % 60 == 0) {
+                    wprintf(L"Frame #%d: %dx%d, time=%lld, elapsed=%lld, interval=%lld, send=%d\n", 
+                        frameCount, desc.Width, desc.Height, 
+                        (long long)info.LastPresentTime.QuadPart,
+                        (long long)(now - lastFrameTime),
+                        (long long)frameInterval,
+                        timeToSend ? 1 : 0);
                 }
 
-                if (now - lastFrameTime >= frameInterval) {
+                if (timeToSend) {
                     D3D11_MAPPED_SUBRESOURCE mapped;
                     if (SUCCEEDED(ctx->Map(tex, 0, D3D11_MAP_READ, 0, &mapped))) {
                         std::vector<uint8_t> rgbData(desc.Width * desc.Height * 3);
@@ -184,14 +194,15 @@ int main() {
                         frame.timestamp = (double)now / 1000.0;
                         frame.data = rgbData;
                         
-                        if (network.SendVideoFrame(frame)) {
-                            if (frameCount % 20 == 0) {
-                                wprintf(L"Sent frame #%d (%dx%d, %d bytes)\n", 
-                                    frameCount, desc.Width, desc.Height, frame.data.size());
-                            }
+                        bool sent = network.SendVideoFrame(frame);
+                        if (sent) {
+                            wprintf(L"  -> Sent! (%d bytes)\n", frame.data.size());
+                        } else {
+                            wprintf(L"  -> Send FAILED!\n");
                         }
                         
                         lastFrameTime = now;
+                        firstFrame = false;
                     }
                 }
                 
@@ -200,7 +211,6 @@ int main() {
         }
         
         dup->ReleaseFrame();
-        frameCount++;
     }
 
     network.Disconnect();
