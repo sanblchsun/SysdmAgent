@@ -1,8 +1,8 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <stdio.h>
-#include <gdiplus.h>
 #include <objbase.h>
+#include <gdiplus.h>
 
 #include "NetworkManager.h"
 
