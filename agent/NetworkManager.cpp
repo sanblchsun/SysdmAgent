@@ -252,31 +252,28 @@ bool NetworkManager::SendVideoFrame(const VideoFrame& frame) {
     return result;
 }
 
-void NetworkManager::ProcessEvents() {
-}
-
 bool NetworkManager::SendVideoFrameHTTP(const VideoFrame& frame) {
-    HINTERNET hSession = WinHttpOpen(L"SysdmAgent/1.0", 
+    HINTERNET hSess = WinHttpOpen(L"SysdmAgent/1.0", 
         WINHTTP_ACCESS_TYPE_NO_PROXY,
         WINHTTP_NO_PROXY_NAME,
         WINHTTP_NO_PROXY_BYPASS, 0);
     
-    if (!hSession) return false;
+    if (!hSess) return false;
 
-    HINTERNET hConnect = WinHttpConnect(hSession, host.c_str(), (INTERNET_PORT)port, 0);
-    if (!hConnect) {
-        WinHttpCloseHandle(hSession);
+    HINTERNET hConn = WinHttpConnect(hSess, host.c_str(), (INTERNET_PORT)port, 0);
+    if (!hConn) {
+        WinHttpCloseHandle(hSess);
         return false;
     }
 
     std::wstring path = wsPath + L"/frame";
     
-    HINTERNET hReq = WinHttpOpenRequest(hConnect, L"POST", path.c_str(),
+    HINTERNET hReq = WinHttpOpenRequest(hConn, L"POST", path.c_str(),
         NULL, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, 0);
     
     if (!hReq) {
-        WinHttpCloseHandle(hConnect);
-        WinHttpCloseHandle(hSession);
+        WinHttpCloseHandle(hConn);
+        WinHttpCloseHandle(hSess);
         return false;
     }
 
@@ -286,23 +283,26 @@ bool NetworkManager::SendVideoFrameHTTP(const VideoFrame& frame) {
     *(double*)(buffer.data() + 8) = frame.timestamp;
     memcpy(buffer.data() + 16, frame.data.data(), frame.data.size());
 
-    BOOL result = WinHttpSendRequest(hReq, 
-        L"Content-Type: application/octet-stream\r\n",
+    BOOL sent = WinHttpSendRequest(hReq, 
+        L"Content-Type: application/octet-stream",
         (DWORD)-1, buffer.data(), (DWORD)buffer.size(), (DWORD)buffer.size(), 0);
 
     DWORD statusCode = 0;
     DWORD statusCodeSize = sizeof(statusCode);
-    if (result) {
+    if (sent) {
         WinHttpReceiveResponse(hReq, NULL);
         WinHttpQueryHeaders(hReq, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
             WINHTTP_HEADER_NAME_BY_INDEX, &statusCode, &statusCodeSize, WINHTTP_NO_HEADER_INDEX);
     }
 
     WinHttpCloseHandle(hReq);
-    WinHttpCloseHandle(hConnect);
-    WinHttpCloseHandle(hSession);
+    WinHttpCloseHandle(hConn);
+    WinHttpCloseHandle(hSess);
 
     Log(L"[HTTP] SendVideoFrameHTTP: %dx%d, status=%d", frame.width, frame.height, statusCode);
     
-    return result && statusCode == 200;
+    return sent && statusCode == 200;
+}
+
+void NetworkManager::ProcessEvents() {
 }

@@ -1,13 +1,10 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <stdio.h>
-#include <objbase.h>
-#include <gdiplus.h>
 
 #include "NetworkManager.h"
 
 #pragma comment(lib, "winhttp.lib")
-#pragma comment(lib, "gdiplus.lib")
 
 #define SERVER_HOST L"192.168.88.127"
 #define SERVER_PORT 8000
@@ -24,7 +21,7 @@ static void Log(const wchar_t* fmt, ...) {
 }
 
 int main() {
-    wprintf(L"=== Test: Sending 100 small messages ===\n");
+    wprintf(L"=== Test: Sending 10 messages with flush ===\n");
 
     NetworkManager network;
     std::wstring wsPath = std::wstring(L"/ws/agent/") + AGENT_ID;
@@ -49,29 +46,27 @@ int main() {
         }
     });
 
-    wprintf(L"Connecting to %s:%d%s...\n", SERVER_HOST, SERVER_PORT, wsPath.c_str());
+    wprintf(L"Connecting...\n");
     
     if (!network.Connect(SERVER_HOST, SERVER_PORT, wsPath)) {
         wprintf(L"Failed to connect\n");
         return 1;
     }
 
-    wprintf(L"Connected! Sending 100 text messages...\n");
+    wprintf(L"Connected! Sending 10 messages...\n");
     
-    for (int i = 0; i < 100 && network.GetState() == WebSocketState::Connected; i++) {
+    for (int i = 0; i < 10 && network.GetState() == WebSocketState::Connected; i++) {
         char msg[64];
         sprintf_s(msg, "{\"msg\":%d}", i);
         
         bool sent = network.SendText(msg);
-        wprintf(L"Sent #%d: %s (result=%d)\n", i, sent ? L"OK" : L"FAIL", sent);
+        wprintf(L"Sent #%d: %s\n", i, sent ? L"OK" : L"FAIL");
         
-        Sleep(100);
+        Sleep(200);
         network.ProcessEvents();
     }
 
-    wprintf(L"Done. Disconnecting...\n");
+    wprintf(L"Done.\n");
     network.Disconnect();
-    
-    wprintf(L"Test complete.\n");
     return 0;
 }
