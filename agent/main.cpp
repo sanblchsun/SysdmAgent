@@ -62,28 +62,31 @@ public:
         CLSID jpgClsid;
         GetEncoderClsid(L"image/jpeg", &jpgClsid);
         
+        HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, 0);
         IStream* pStream = NULL;
-        CreateStreamOnHGlobal(NULL, TRUE, &pStream);
+        CreateStreamOnHGlobal(hMem, TRUE, &pStream);
         
         EncoderParameters encoderParams;
         encoderParams.Count = 1;
         encoderParams.Parameter[0].Guid = EncoderQuality;
         encoderParams.Parameter[0].Type = EncoderParameterValueTypeLong;
         encoderParams.Parameter[0].NumberOfValues = 1;
-        encoderParams.Parameter[0].Value = &JPEG_QUALITY;
+        ULONG quality = JPEG_QUALITY;
+        encoderParams.Parameter[0].Value = &quality;
         
         bitmap.Save(pStream, &jpgClsid, &encoderParams);
         
-        SIZE_T size;
-        GetStreamSize(pStream, &size);
+        STATSTG stat;
+        pStream->Stat(&stat, STATFLAG_DEFAULT);
+        SIZE_T size = stat.cbSize.QuadPart;
         
-        HGLOBAL hMem;
-        GetHGlobalFromStream(pStream, &hMem);
-        LPVOID pData = GlobalLock(hMem);
+        LARGE_INTEGER pos;
+        pos.QuadPart = 0;
+        pStream->Seek(pos, STREAM_SEEK_SET, NULL);
         
-        std::vector<uint8_t> jpegData((uint8_t*)pData, (uint8_t*)pData + size);
+        std::vector<uint8_t> jpegData((size_t)size);
+        pStream->Read(jpegData.data(), (ULONG)size, NULL);
         
-        GlobalUnlock(hMem);
         pStream->Release();
         
         return jpegData;
@@ -439,7 +442,7 @@ int main() {
     printf("\n=== Summary ===\n");
     printf("Frames sent: %d\n", frameCount);
     printf("Total bytes: %d (%.2f MB)\n", totalBytes, totalBytes / 1024.0 / 1024.0);
-    printf("Duration: %ld seconds\n", totalSec);
+    printf("Duration: %lld seconds\n", (long long)totalSec);
     printf("Avg FPS: %.1f\n", (float)frameCount / totalSec);
     printf("Avg frame size: %d bytes\n", frameCount > 0 ? totalBytes / frameCount : 0);
     
