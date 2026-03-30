@@ -108,7 +108,6 @@ int main() {
     int frameCount = 0;
     int64_t lastFrameTime = 0;
     int64_t frameInterval = 1000 / VIDEO_FPS;
-    bool firstFrame = true;
 
     wprintf(L"Starting capture loop (%d FPS)...\n", VIDEO_FPS);
 
@@ -156,20 +155,21 @@ int main() {
                 D3D11_TEXTURE2D_DESC desc;
                 tex->GetDesc(&desc);
                 
-                bool timeToSend = (now - lastFrameTime >= frameInterval) || firstFrame;
+                int64_t elapsed = (lastFrameTime == 0) ? 9999 : (now - lastFrameTime);
+                bool shouldSend = elapsed >= frameInterval;
                 
-                if (firstFrame || frameCount % 60 == 0) {
-                    wprintf(L"Frame #%d: %dx%d, time=%lld, elapsed=%lld, interval=%lld, send=%d\n", 
-                        frameCount, desc.Width, desc.Height, 
-                        (long long)info.LastPresentTime.QuadPart,
-                        (long long)(now - lastFrameTime),
-                        (long long)frameInterval,
-                        timeToSend ? 1 : 0);
+                if (frameCount <= 5) {
+                    wprintf(L"[%lld] Frame #%d: %dx%d, elapsed=%lld, interval=%lld, send=%d\n", 
+                        now, frameCount, desc.Width, desc.Height, elapsed, frameInterval, shouldSend);
                 }
 
-                if (timeToSend) {
+                if (shouldSend) {
                     D3D11_MAPPED_SUBRESOURCE mapped;
-                    if (SUCCEEDED(ctx->Map(tex, 0, D3D11_MAP_READ, 0, &mapped))) {
+                    hr = ctx->Map(tex, 0, D3D11_MAP_READ, 0, &mapped);
+                    
+                    if (FAILED(hr)) {
+                        wprintf(L"  Map FAILED: 0x%08X\n", hr);
+                    } else {
                         std::vector<uint8_t> rgbData(desc.Width * desc.Height * 3);
                         
                         for (int y = 0; y < (int)desc.Height; y++) {
@@ -194,15 +194,11 @@ int main() {
                         frame.timestamp = (double)now / 1000.0;
                         frame.data = rgbData;
                         
+                        wprintf(L"  Sending %d bytes...\n", frame.data.size());
                         bool sent = network.SendVideoFrame(frame);
-                        if (sent) {
-                            wprintf(L"  -> Sent! (%d bytes)\n", frame.data.size());
-                        } else {
-                            wprintf(L"  -> Send FAILED!\n");
-                        }
+                        wprintf(L"  Result: %s\n", sent ? L"SENT!" : L"FAILED!");
                         
                         lastFrameTime = now;
-                        firstFrame = false;
                     }
                 }
                 
