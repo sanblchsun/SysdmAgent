@@ -158,7 +158,7 @@ void NetworkManager::ReceiveLoop() {
             VideoCallback cb = onVideo;
             LeaveCriticalSection(&cs);
             
-            if (cb && bytesRead > 8) {
+            if (cb && bytesRead > 16) {
                 VideoFrame frame;
                 frame.width = *(int*)buffer;
                 frame.height = *(int*)(buffer + 4);
@@ -209,7 +209,22 @@ void NetworkManager::Disconnect() {
 }
 
 bool NetworkManager::SendText(const std::string& message) {
-    return SendBinary((const uint8_t*)message.c_str(), message.length());
+    EnterCriticalSection(&cs);
+    bool canSend = (state == WebSocketState::Connected && hRequest != nullptr);
+    LeaveCriticalSection(&cs);
+    
+    if (!canSend) return false;
+
+    Log(L"[WS] SendText: %S", message.c_str());
+    
+    HRESULT hr = WinHttpWebSocketSend(hRequest, WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE, 
+        (PVOID)message.c_str(), (DWORD)message.length());
+    
+    if (FAILED(hr)) {
+        Log(L"[WS] SendText failed: 0x%08X", hr);
+        return false;
+    }
+    return true;
 }
 
 bool NetworkManager::SendBinary(const uint8_t* data, size_t len) {
