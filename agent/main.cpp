@@ -7,11 +7,17 @@
 #include <functional>
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <gdiplus.h>
 #pragma comment(lib, "ws2_32.lib")
+#pragma comment(lib, "gdiplus.lib")
 
 #define SERVER_HOST "192.168.88.127"
 #define SERVER_PORT 8000
 #define AGENT_ID "agent1"
+#define TARGET_FPS 5
+#define JPEG_QUALITY 70
+
+using namespace Gdiplus;
 
 static void Log(const char* fmt, ...) {
     char buf[1024];
@@ -22,6 +28,98 @@ static void Log(const char* fmt, ...) {
     OutputDebugStringA(buf);
     printf("%s\n", buf);
 }
+
+class ScreenCapturer {
+public:
+    ScreenCapturer() : hMemDC(NULL), hMemBitmap(NULL), hOldBitmap(NULL), gdiplusToken(0) {
+        GdiplusStartupInput gdiplusStartupInput;
+        GdiplusStartup(&gdiplusToken, &gdiplusStartupInput, NULL);
+        
+        HDC hDC = GetDC(NULL);
+        screenWidth = GetDeviceCaps(hDC, HORZRES);
+        screenHeight = GetDeviceCaps(hDC, VERTRES);
+        ReleaseDC(NULL, hDC);
+        
+        hMemDC = CreateCompatibleDC(NULL);
+        hMemBitmap = CreateCompatibleBitmap(GetDC(NULL), screenWidth, screenHeight);
+        hOldBitmap = SelectObject(hMemDC, hMemBitmap);
+    }
+    
+    ~ScreenCapturer() {
+        if (hOldBitmap) SelectObject(hMemDC, hOldBitmap);
+        if (hMemBitmap) DeleteObject(hMemBitmap);
+        if (hMemDC) DeleteDC(hMemDC);
+        if (gdiplusToken) GdiplusShutdown(gdiplusToken);
+    }
+    
+    std::vector<uint8_t> CaptureFrame() {
+        HDC hDC = GetDC(NULL);
+        BitBlt(hMemDC, 0, 0, screenWidth, screenHeight, hDC, 0, 0, SRCCOPY);
+        ReleaseDC(NULL, hDC);
+        
+        Bitmap bitmap(hMemBitmap, NULL);
+        CLSID jpgClsid;
+        GetEncoderClsid(L"image/jpeg", &jpgClsid);
+        
+        IStream* pStream = NULL;
+        CreateStreamOnHGlobal(NULL, TRUE, &pStream);
+        
+        EncoderParameters encoderParams;
+        encoderParams.Count = 1;
+        encoderParams.Parameter[0].Guid = EncoderQuality;
+        encoderParams.Parameter[0].Type = EncoderParameterValueTypeLong;
+        encoderParams.Parameter[0].NumberOfValues = 1;
+        encoderParams.Parameter[0].Value = &JPEG_QUALITY;
+        
+        bitmap.Save(pStream, &jpgClsid, &encoderParams);
+        
+        SIZE_T size;
+        GetStreamSize(pStream, &size);
+        
+        HGLOBAL hMem;
+        GetHGlobalFromStream(pStream, &hMem);
+        LPVOID pData = GlobalLock(hMem);
+        
+        std::vector<uint8_t> jpegData((uint8_t*)pData, (uint8_t*)pData + size);
+        
+        GlobalUnlock(hMem);
+        pStream->Release();
+        
+        return jpegData;
+    }
+    
+    int GetWidth() const { return screenWidth; }
+    int GetHeight() const { return screenHeight; }
+    
+private:
+    int GetEncoderClsid(const WCHAR* format, CLSID* pClsid) {
+        UINT num = 0, size = 0;
+        Gdiplus::ImageCodecInfo* pImageCodecInfo = NULL;
+        GetImageEncodersSize(&num, &size);
+        if (size == 0) return -1;
+        
+        pImageCodecInfo = (Gdiplus::ImageCodecInfo*)(malloc(size));
+        if (!pImageCodecInfo) return -1;
+        
+        GetImageEncoders(num, size, pImageCodecInfo);
+        for (UINT i = 0; i < num; ++i) {
+            if (wcscmp(pImageCodecInfo[i].MimeType, format) == 0) {
+                *pClsid = pImageCodecInfo[i].Clsid;
+                free(pImageCodecInfo);
+                return i;
+            }
+        }
+        free(pImageCodecInfo);
+        return -1;
+    }
+    
+    HDC hMemDC;
+    HBITMAP hMemBitmap;
+    HGDIOBJ hOldBitmap;
+    int screenWidth;
+    int screenHeight;
+    ULONG_PTR gdiplusToken;
+};
 
 class WSClient {
 public:
@@ -171,7 +269,6 @@ public:
             return false;
         }
         
-        Log("[WS] Sent %d bytes (opcode=%d)", sent, opcode);
         return true;
     }
     
@@ -203,7 +300,6 @@ private:
                 break;
             }
             
-            bool fin = (header[0] & 0x80) != 0;
             uint8_t opcode = header[0] & 0x0F;
             bool masked = (header[1] & 0x80) != 0;
             uint64_t payloadLen = header[1] & 0x7F;
@@ -215,7 +311,7 @@ private:
             std::vector<uint8_t> fullHeader(headerLen + (masked ? 4 : 0));
             bytes = recv(sock, (char*)fullHeader.data(), headerLen + (masked ? 4 : 0), 0);
             if (bytes != headerLen + (masked ? 4 : 0)) {
-                Log("[WS] Failed to read full header: got %d expected %d", bytes, headerLen + (masked ? 4 : 0));
+                Log("[WS] Failed to read full header");
                 break;
             }
             
@@ -264,7 +360,7 @@ private:
                 std::string msg((char*)payload.data(), payload.size());
                 Log("[WS] Received TEXT: %s", msg.c_str());
                 onMessage(msg);
-            } else if (opcode == 0x2 && onMessage) {
+            } else if (opcode == 0x2) {
                 Log("[WS] Received BINARY: %llu bytes", payloadLen);
             }
         }
@@ -283,32 +379,69 @@ private:
 };
 
 int main() {
-    printf("=== Test Windows WebSocket (manual handshake) ===\n");
+    printf("=== Screen Capture WebSocket Agent ===\n");
     
     WSClient ws;
     ws.SetMessageCallback([](const std::string& msg) { printf("[MSG] %s\n", msg.c_str()); });
     
-    char path[256];
-    sprintf_s(path, "/ws/agent/%s", AGENT_ID);
+    char wsPath[256];
+    sprintf_s(wsPath, "/ws/agent/%s", AGENT_ID);
     
-    if (!ws.Connect(SERVER_HOST, SERVER_PORT, path)) {
+    if (!ws.Connect(SERVER_HOST, SERVER_PORT, wsPath)) {
         printf("Failed to connect\n");
         return 1;
     }
     
-    printf("Connected! Sending 10 messages...\n");
+    printf("Connected! Starting screen capture at %d FPS...\n", TARGET_FPS);
     
-    for (int i = 0; i < 10; i++) {
-        char msg[64];
-        sprintf_s(msg, "{\"msg\":%d}", i);
+    ScreenCapturer capturer;
+    printf("Screen: %dx%d\n", capturer.GetWidth(), capturer.GetHeight());
+    
+    LARGE_INTEGER freq, start, end;
+    QueryPerformanceFrequency(&freq);
+    
+    int frameCount = 0;
+    int totalBytes = 0;
+    auto startTime = std::chrono::steady_clock::now();
+    
+    while (ws.SendText("{\"type\":\"start\"}")) {
+        auto frameStart = std::chrono::steady_clock::now();
         
-        bool sent = ws.SendText(msg);
-        printf("Sent #%d: %s\n", i, sent ? "OK" : "FAIL");
+        std::vector<uint8_t> jpegData = capturer.CaptureFrame();
         
-        Sleep(200);
+        if (!jpegData.empty()) {
+            bool sent = ws.SendBinary(jpegData.data(), jpegData.size());
+            if (sent) {
+                frameCount++;
+                totalBytes += (int)jpegData.size();
+                printf("[Frame #%d] Sent %d bytes\n", frameCount, (int)jpegData.size());
+            } else {
+                printf("Failed to send frame\n");
+                break;
+            }
+        }
+        
+        auto frameEnd = std::chrono::steady_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(frameEnd - frameStart).count();
+        int targetDelay = 1000 / TARGET_FPS;
+        int delay = targetDelay - (int)elapsed;
+        if (delay > 0) Sleep(delay);
+        
+        auto now = std::chrono::steady_clock::now();
+        auto totalElapsed = std::chrono::duration_cast<std::chrono::seconds>(now - startTime).count();
+        if (totalElapsed >= 30) break;
     }
     
-    printf("Done.\n");
+    auto endTime = std::chrono::steady_clock::now();
+    auto totalSec = std::chrono::duration_cast<std::chrono::seconds>(endTime - startTime).count();
+    
+    printf("\n=== Summary ===\n");
+    printf("Frames sent: %d\n", frameCount);
+    printf("Total bytes: %d (%.2f MB)\n", totalBytes, totalBytes / 1024.0 / 1024.0);
+    printf("Duration: %ld seconds\n", totalSec);
+    printf("Avg FPS: %.1f\n", (float)frameCount / totalSec);
+    printf("Avg frame size: %d bytes\n", frameCount > 0 ? totalBytes / frameCount : 0);
+    
     ws.Disconnect();
     return 0;
 }
