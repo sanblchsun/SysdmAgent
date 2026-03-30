@@ -1,16 +1,11 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <stdio.h>
-#include <dxgi.h>
-#include <dxgi1_2.h>
-#include <d3d11.h>
 #include <gdiplus.h>
 #include <objbase.h>
 
 #include "NetworkManager.h"
 
-#pragma comment(lib, "d3d11.lib")
-#pragma comment(lib, "dxgi.lib")
 #pragma comment(lib, "winhttp.lib")
 #pragma comment(lib, "gdiplus.lib")
 
@@ -42,18 +37,28 @@ public:
         Gdiplus::GdiplusShutdown(gdiplusToken);
     }
     
-    bool Encode(const uint8_t* rgb, int width, int height, std::vector<uint8_t>& jpegOut) {
+    bool CaptureScreen(int& width, int& height, std::vector<uint8_t>& jpegOut) {
         using namespace Gdiplus;
         
-        Bitmap bitmap(width, height, PixelFormat24bppRGB);
+        HWND hwnd = GetDesktopWindow();
+        HDC hdcScreen = GetDC(hwnd);
+        if (!hdcScreen) return false;
         
-        for (int y = 0; y < height; y++) {
-            for (int x = 0; x < width; x++) {
-                int idx = (y * width + x) * 3;
-                Color c(rgb[idx], rgb[idx + 1], rgb[idx + 2]);
-                bitmap.SetPixel(x, y, c);
-            }
-        }
+        int screenW = GetDeviceCaps(hdcScreen, HORZRES);
+        int screenH = GetDeviceCaps(hdcScreen, VERTRES);
+        
+        HDC hdcMem = CreateCompatibleDC(hdcScreen);
+        HBITMAP hBitmap = CreateCompatibleBitmap(hdcScreen, screenW, screenH);
+        HBITMAP hOldBitmap = (HBITMAP)SelectObject(hdcMem, hBitmap);
+        
+        BitBlt(hdcMem, 0, 0, screenW, screenH, hdcScreen, 0, 0, SRCCOPY);
+        
+        Bitmap bitmap(hBitmap, NULL);
+        
+        SelectObject(hdcMem, hOldBitmap);
+        DeleteDC(hdcMem);
+        ReleaseDC(hwnd, hdcScreen);
+        DeleteObject(hBitmap);
         
         HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, 0);
         if (!hMem) return false;
@@ -90,6 +95,9 @@ public:
         stream->Release();
         GlobalFree(hMem);
         
+        width = screenW;
+        height = screenH;
+        
         return !jpegOut.empty();
     }
     
@@ -121,52 +129,9 @@ private:
 };
 
 int main() {
-    wprintf(L"=== SysdmAgent Starting ===\n");
+    wprintf(L"=== SysdmAgent Starting (GDI Capture) ===\n");
 
     JpegEncoder encoder;
-
-    HDESK hDesk = OpenInputDesktop(0, FALSE, GENERIC_ALL);
-    if (!hDesk) {
-        wprintf(L"Failed to open input desktop\n");
-        return 1;
-    }
-    SetThreadDesktop(hDesk);
-    CloseDesktop(hDesk);
-
-    ID3D11Device* device = nullptr;
-    ID3D11DeviceContext* ctx = nullptr;
-    D3D_FEATURE_LEVEL level;
-    HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0,
-        nullptr, 0, D3D11_SDK_VERSION, &device, &level, &ctx);
-    if (FAILED(hr)) {
-        wprintf(L"Failed to create D3D device\n");
-        return 1;
-    }
-
-    IDXGIDevice* dxgiDevice = nullptr;
-    device->QueryInterface(__uuidof(IDXGIDevice), (void**)&dxgiDevice);
-    IDXGIAdapter* adapter = nullptr;
-    dxgiDevice->GetParent(__uuidof(IDXGIAdapter), (void**)&adapter);
-    dxgiDevice->Release();
-
-    IDXGIOutput* output = nullptr;
-    adapter->EnumOutputs(0, &output);
-    adapter->Release();
-
-    IDXGIOutput1* output1 = nullptr;
-    output->QueryInterface(__uuidof(IDXGIOutput1), (void**)&output1);
-    output->Release();
-
-    IDXGIOutputDuplication* dup = nullptr;
-    hr = output1->DuplicateOutput(device, &dup);
-    output1->Release();
-    if (FAILED(hr)) {
-        wprintf(L"Failed to create duplication: 0x%08X\n", hr);
-        device->Release();
-        return 1;
-    }
-
-    ID3D11Texture2D* stagingTex = nullptr;
 
     NetworkManager network;
     std::wstring wsPath = std::wstring(L"/ws/agent/") + AGENT_ID;
@@ -196,165 +161,46 @@ int main() {
     
     if (!network.Connect(SERVER_HOST, SERVER_PORT, wsPath)) {
         wprintf(L"Failed to connect\n");
-        dup->Release();
-        ctx->Release();
-        device->Release();
         return 1;
     }
 
     int frameCount = 0;
     int64_t lastFrameTime = 0;
     int64_t frameInterval = 1000 / VIDEO_FPS;
-    int captureWidth = 0;
-    int captureHeight = 0;
 
     wprintf(L"Starting capture loop (%d FPS)...\n", VIDEO_FPS);
 
     while (network.GetState() == WebSocketState::Connected) {
         int64_t now = GetTickCount64();
+        int64_t elapsed = (lastFrameTime == 0) ? 9999 : (now - lastFrameTime);
         
-        DXGI_OUTDUPL_FRAME_INFO info = {};
-        IDXGIResource* res = nullptr;
-
-        hr = dup->AcquireNextFrame(1000, &info, &res);
-        
-        if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
-            continue;
-        }
-        
-        if (hr == DXGI_ERROR_ACCESS_LOST) {
-            wprintf(L"Access lost, reinitializing...\n");
-            dup->Release();
+        if (elapsed >= frameInterval) {
+            int width, height;
+            std::vector<uint8_t> jpegData;
             
-            device->QueryInterface(__uuidof(IDXGIDevice), (void**)&dxgiDevice);
-            dxgiDevice->GetParent(__uuidof(IDXGIAdapter), (void**)&adapter);
-            dxgiDevice->Release();
-            adapter->EnumOutputs(0, &output);
-            adapter->Release();
-            output->QueryInterface(__uuidof(IDXGIOutput1), (void**)&output1);
-            output->Release();
-            output1->DuplicateOutput(device, &dup);
-            output1->Release();
-            
-            if (stagingTex) {
-                stagingTex->Release();
-                stagingTex = nullptr;
+            if (encoder.CaptureScreen(width, height, jpegData)) {
+                VideoFrame frame;
+                frame.width = width;
+                frame.height = height;
+                frame.timestamp = (double)now / 1000.0;
+                frame.data = jpegData;
+                
+                bool sent = network.SendVideoFrame(frame);
+                
+                if (frameCount <= 5 || frameCount % 50 == 0) {
+                    wprintf(L"Frame #%d: %dx%d, JPEG=%zdb, sent=%d\n", 
+                        frameCount, width, height, jpegData.size(), sent);
+                }
+                
+                lastFrameTime = now;
             }
-            captureWidth = 0;
-            captureHeight = 0;
-            continue;
+            frameCount++;
+        } else {
+            Sleep(10);
         }
-        
-        if (FAILED(hr)) {
-            wprintf(L"AcquireNextFrame failed: 0x%08X\n", hr);
-            break;
-        }
-
-        frameCount++;
-        
-        if (info.LastPresentTime.QuadPart != 0) {
-            ID3D11Texture2D* tex = nullptr;
-            res->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&tex);
-            res->Release();
-
-            if (tex) {
-                D3D11_TEXTURE2D_DESC desc;
-                tex->GetDesc(&desc);
-                
-                if (captureWidth != desc.Width || captureHeight != desc.Height) {
-                    wprintf(L"New size: %dx%d\n", desc.Width, desc.Height);
-                    captureWidth = desc.Width;
-                    captureHeight = desc.Height;
-                    
-                    if (stagingTex) {
-                        stagingTex->Release();
-                    }
-                    
-                    D3D11_TEXTURE2D_DESC stagingDesc = {};
-                    stagingDesc.Width = desc.Width;
-                    stagingDesc.Height = desc.Height;
-                    stagingDesc.MipLevels = 1;
-                    stagingDesc.ArraySize = 1;
-                    stagingDesc.Format = desc.Format;
-                    stagingDesc.SampleDesc = { 1, 0 };
-                    stagingDesc.Usage = D3D11_USAGE_STAGING;
-                    stagingDesc.BindFlags = 0;
-                    stagingDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-                    
-                    hr = device->CreateTexture2D(&stagingDesc, nullptr, &stagingTex);
-                    if (FAILED(hr)) {
-                        wprintf(L"Failed to create staging texture: 0x%08X\n", hr);
-                        tex->Release();
-                        continue;
-                    }
-                }
-                
-                ctx->CopyResource(stagingTex, tex);
-                
-                int64_t elapsed = (lastFrameTime == 0) ? 9999 : (now - lastFrameTime);
-                bool shouldSend = elapsed >= frameInterval;
-                
-                if (frameCount <= 3) {
-                    wprintf(L"Frame #%d: %dx%d, elapsed=%lld, send=%d\n", 
-                        frameCount, desc.Width, desc.Height, elapsed, shouldSend);
-                }
-
-                if (shouldSend) {
-                    D3D11_MAPPED_SUBRESOURCE mapped;
-                    hr = ctx->Map(stagingTex, 0, D3D11_MAP_READ, 0, &mapped);
-                    
-                    if (FAILED(hr)) {
-                        wprintf(L"  Map FAILED: 0x%08X\n", hr);
-                    } else {
-                        std::vector<uint8_t> rgbData(desc.Width * desc.Height * 3);
-                        
-                        for (int y = 0; y < (int)desc.Height; y++) {
-                            uint8_t* src = (uint8_t*)mapped.pData + y * mapped.RowPitch;
-                            uint8_t* dst = rgbData.data() + y * desc.Width * 3;
-                            
-                            if (mapped.RowPitch >= desc.Width * 4) {
-                                for (int x = 0; x < (int)desc.Width; x++) {
-                                    uint8_t* s = src + x * 4;
-                                    dst[x * 3] = s[2];
-                                    dst[x * 3 + 1] = s[1];
-                                    dst[x * 3 + 2] = s[0];
-                                }
-                            }
-                        }
-                        
-                        ctx->Unmap(stagingTex, 0);
-                        
-                        std::vector<uint8_t> jpegData;
-                        if (encoder.Encode(rgbData.data(), desc.Width, desc.Height, jpegData)) {
-                            VideoFrame frame;
-                            frame.width = desc.Width;
-                            frame.height = desc.Height;
-                            frame.timestamp = (double)now / 1000.0;
-                            frame.data = jpegData;
-                            
-                            bool sent = network.SendVideoFrame(frame);
-                            if (frameCount <= 3) {
-                                wprintf(L"  JPEG: %zdb, sent=%d\n", jpegData.size(), sent);
-                            }
-                        }
-                        
-                        lastFrameTime = now;
-                    }
-                }
-                
-                tex->Release();
-            }
-        }
-        
-        dup->ReleaseFrame();
     }
 
     network.Disconnect();
-    if (stagingTex) stagingTex->Release();
-    dup->Release();
-    ctx->Release();
-    device->Release();
-
     wprintf(L"Agent stopped.\n");
     return 0;
 }
