@@ -13,8 +13,7 @@
 #define SERVER_PORT 8000
 #define AGENT_ID L"agent1"
 
-#define VIDEO_FPS 5
-#define JPEG_QUALITY 70
+#define VIDEO_FPS 2
 
 static void Log(const wchar_t* fmt, ...) {
     wchar_t buf[1024];
@@ -129,7 +128,7 @@ private:
 };
 
 int main() {
-    wprintf(L"=== SysdmAgent Starting (GDI Capture) ===\n");
+    wprintf(L"=== SysdmAgent Starting (GDI Capture, FPS=%d) ===\n", VIDEO_FPS);
 
     JpegEncoder encoder;
 
@@ -144,7 +143,7 @@ int main() {
         switch (state) {
             case WebSocketState::Connected:
                 wprintf(L"[WS] Connected!\n");
-                network.SendText("{\"type\":\"agent_ready\",\"width\":1920,\"height\":1080}");
+                network.SendText("{\"type\":\"agent_ready\"}");
                 break;
             case WebSocketState::Disconnected:
                 wprintf(L"[WS] Disconnected\n");
@@ -187,17 +186,18 @@ int main() {
                 
                 bool sent = network.SendVideoFrame(frame);
                 
-                if (frameCount <= 5 || frameCount % 50 == 0) {
-                    wprintf(L"Frame #%d: %dx%d, JPEG=%zdb, sent=%d\n", 
-                        frameCount, width, height, jpegData.size(), sent);
-                }
+                wprintf(L"[%lld] Frame #%d: %dx%d, JPEG=%zdb, sent=%d\n", 
+                    now, frameCount, width, height, jpegData.size(), sent);
                 
+                Sleep(100);
                 lastFrameTime = now;
             }
             frameCount++;
         } else {
             Sleep(10);
         }
+        
+        network.ProcessEvents();
     }
 
     network.Disconnect();

@@ -11,7 +11,7 @@ static void Log(const wchar_t* fmt, ...) {
     wprintf(L"%s\n", buf);
 }
 
-NetworkManager::NetworkManager() {
+NetworkManager::NetworkManager() : running(false), state(WebSocketState::Disconnected) {
     InitializeCriticalSection(&cs);
 }
 
@@ -119,7 +119,7 @@ void NetworkManager::ReceiveLoop() {
     Log(L"[WS] Receive thread started");
     
     while (running) {
-        uint8_t buffer[16384];
+        uint8_t buffer[8192];
         DWORD bytesRead = 0;
         WINHTTP_WEB_SOCKET_BUFFER_TYPE msgType = WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE;
         
@@ -138,7 +138,7 @@ void NetworkManager::ReceiveLoop() {
 
         if (bytesRead == 0) {
             if (msgType == WINHTTP_WEB_SOCKET_CLOSE_BUFFER_TYPE) {
-                Log(L"[WS] Server closed");
+                Log(L"[WS] Server closed connection");
                 break;
             }
             continue;
@@ -153,20 +153,6 @@ void NetworkManager::ReceiveLoop() {
                 std::string msg((char*)buffer, bytesRead);
                 cb(msg);
             }
-        } else if (msgType == WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE) {
-            EnterCriticalSection(&cs);
-            VideoCallback cb = onVideo;
-            LeaveCriticalSection(&cs);
-            
-            if (cb && bytesRead > 16) {
-                VideoFrame frame;
-                frame.width = *(int*)buffer;
-                frame.height = *(int*)(buffer + 4);
-                frame.timestamp = *(double*)(buffer + 8);
-                frame.data.resize(bytesRead - 16);
-                memcpy(frame.data.data(), buffer + 16, bytesRead - 16);
-                cb(frame);
-            }
         }
     }
     
@@ -176,6 +162,7 @@ void NetworkManager::ReceiveLoop() {
 void NetworkManager::Disconnect() {
     EnterCriticalSection(&cs);
     running = false;
+    LeaveCriticalSection(&cs);
     
     if (hRequest) {
         if (isWebSocket) {
@@ -194,6 +181,8 @@ void NetworkManager::Disconnect() {
     }
 
     isWebSocket = false;
+    
+    EnterCriticalSection(&cs);
     state = WebSocketState::Disconnected;
     LeaveCriticalSection(&cs);
 
@@ -214,12 +203,9 @@ bool NetworkManager::SendText(const std::string& message) {
     LeaveCriticalSection(&cs);
     
     if (!canSend) {
-        Log(L"[WS] SendText: not connected");
         return false;
     }
 
-    Log(L"[WS] SendText: %S", message.c_str());
-    
     HRESULT hr = WinHttpWebSocketSend(hRequest, WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE, 
         (PVOID)message.c_str(), (DWORD)message.length());
     
@@ -228,12 +214,7 @@ bool NetworkManager::SendText(const std::string& message) {
         return false;
     }
     
-    DWORD bytesRead = 0;
-    WINHTTP_WEB_SOCKET_BUFFER_TYPE respType;
-    uint8_t respBuffer[128];
-    hr = WinHttpWebSocketReceive(hRequest, respBuffer, sizeof(respBuffer), &bytesRead, &respType);
-    
-    return SUCCEEDED(hr);
+    return true;
 }
 
 bool NetworkManager::SendBinary(const uint8_t* data, size_t len) {
@@ -265,10 +246,7 @@ bool NetworkManager::SendVideoFrame(const VideoFrame& frame) {
     *(double*)(buffer.data() + 8) = frame.timestamp;
     memcpy(buffer.data() + 16, frame.data.data(), frame.data.size());
     
-    bool result = SendBinary(buffer.data(), buffer.size());
-    Log(L"[WS] SendVideoFrame: %dx%d, %d bytes, result=%d", frame.width, frame.height, buffer.size(), result);
-    
-    return result;
+    return SendBinary(buffer.data(), buffer.size());
 }
 
 void NetworkManager::ProcessEvents() {
