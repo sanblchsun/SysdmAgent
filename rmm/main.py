@@ -62,7 +62,7 @@ async def agent_ws(ws: WebSocket, agent_id: str):
             if data["type"] == "websocket.receive":
                 if "text" in data:
                     text_data = data["text"]
-                    logger.info(f"Agent {agent_id} text: {text_data[:80]}...")
+                    logger.info(f"Agent {agent_id} text: {text_data[:100]}")
                     
                     viewer = viewers.get(agent_id)
                     if viewer:
@@ -74,15 +74,18 @@ async def agent_ws(ws: WebSocket, agent_id: str):
                             
                 elif "bytes" in data:
                     bytes_data = data["bytes"]
-                    logger.debug(f"Agent {agent_id} binary: {len(bytes_data)} bytes")
+                    logger.info(f"Agent {agent_id} binary: {len(bytes_data)} bytes")
                     
                     viewer = viewers.get(agent_id)
                     if viewer:
                         try:
                             await viewer.send_bytes(bytes_data)
+                            logger.info(f"Forwarded to viewer: {len(bytes_data)} bytes")
                         except Exception as e:
                             logger.error(f"Error sending binary to viewer: {e}")
                             viewers.pop(agent_id, None)
+                    else:
+                        logger.warning(f"No viewer connected for {agent_id}")
 
     except WebSocketDisconnect:
         logger.info(f"Agent disconnected: {agent_id}")
@@ -120,7 +123,7 @@ async def viewer_ws(ws: WebSocket, agent_id: str):
             if data["type"] == "websocket.receive":
                 text_data = data.get("text")
                 if text_data:
-                    logger.info(f"Viewer {agent_id} text: {text_data[:80]}...")
+                    logger.info(f"Viewer {agent_id} text: {text_data[:100]}")
                     
                     agent = agents.get(agent_id)
                     if agent:
