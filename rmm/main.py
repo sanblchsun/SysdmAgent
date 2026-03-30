@@ -1,9 +1,11 @@
 # rmm/main.py
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.templating import Jinja2Templates
+from starlette.responses import Response
 import os
 import asyncio
+import struct
 import logging
 from typing import Dict
 
@@ -28,6 +30,7 @@ templates = Jinja2Templates(directory=os.path.join(BASE_DIR, "templates"))
 
 agents: Dict[str, WebSocket] = {}
 viewers: Dict[str, WebSocket] = {}
+last_frame: Dict[str, bytes] = {}
 
 
 @app.get("/")
@@ -39,8 +42,45 @@ async def index(request: Request):
 async def status():
     return {
         "agents": list(agents.keys()),
-        "viewers": list(viewers.keys())
+        "viewers": list(viewers.keys()),
+        "has_frame": {k: len(v) > 0 for k, v in last_frame.items()}
     }
+
+
+@app.post("/frame/{agent_id}")
+async def receive_frame(agent_id: str, request: Request):
+    body = await request.body()
+    logger.info(f"HTTP Frame from {agent_id}: {len(body)} bytes")
+    
+    if len(body) < 16:
+        return Response("Too small", status_code=400)
+    
+    width, height, timestamp = struct.unpack('<iid', body[:16])
+    jpeg_data = body[16:]
+    
+    logger.info(f"Frame: {width}x{height}, JPEG={len(jpeg_data)} bytes")
+    
+    last_frame[agent_id] = body
+    
+    viewer = viewers.get(agent_id)
+    if viewer:
+        try:
+            await viewer.send_bytes(body)
+            logger.info(f"Forwarded frame to viewer")
+        except Exception as e:
+            logger.error(f"Error forwarding frame: {e}")
+            viewers.pop(agent_id, None)
+    
+    return Response("OK", status_code=200)
+
+
+@app.get("/frame/{agent_id}")
+async def get_frame(agent_id: str):
+    frame = last_frame.get(agent_id)
+    if not frame:
+        raise HTTPException(404, "No frame available")
+    
+    return Response(frame, media_type="application/octet-stream")
 
 
 @app.websocket("/ws/agent/{agent_id}")
@@ -55,8 +95,6 @@ async def agent_ws(ws: WebSocket, agent_id: str):
             try:
                 data = await asyncio.wait_for(ws.receive(), timeout=5.0)
             except asyncio.TimeoutError:
-                logger.debug(f"Agent {agent_id}: timeout, sending ping")
-                await ws.send_text("ping")
                 continue
                 
             logger.info(f"Agent {agent_id}: type={data.get('type')}")

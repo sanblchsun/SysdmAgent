@@ -39,6 +39,7 @@ public:
     bool SendText(const std::string& message);
     bool SendBinary(const uint8_t* data, size_t len);
     bool SendVideoFrame(const VideoFrame& frame);
+    bool SendVideoFrameHTTP(const VideoFrame& frame);
 
     void SetMessageCallback(MessageCallback cb) { onMessage = std::move(cb); }
     void SetStateCallback(StateCallback cb) { onStateChange = std::move(cb); }
@@ -66,6 +67,6 @@ private:
     VideoCallback onVideo;
 
     std::wstring host;
-    std::wstring path;
+    std::wstring wsPath;
     int port = 0;
 };

@@ -23,7 +23,7 @@ NetworkManager::~NetworkManager() {
 bool NetworkManager::Connect(const std::wstring& host, int port, const std::wstring& path) {
     this->host = host;
     this->port = port;
-    this->path = path;
+    this->wsPath = path;
 
     if (state == WebSocketState::Connected || state == WebSocketState::Connecting) {
         Disconnect();
@@ -246,8 +246,63 @@ bool NetworkManager::SendVideoFrame(const VideoFrame& frame) {
     *(double*)(buffer.data() + 8) = frame.timestamp;
     memcpy(buffer.data() + 16, frame.data.data(), frame.data.size());
     
-    return SendBinary(buffer.data(), buffer.size());
+    bool result = SendBinary(buffer.data(), buffer.size());
+    Log(L"[WS] SendVideoFrame: %dx%d, %d bytes, result=%d", frame.width, frame.height, buffer.size(), result);
+    
+    return result;
 }
 
 void NetworkManager::ProcessEvents() {
+}
+
+bool NetworkManager::SendVideoFrameHTTP(const VideoFrame& frame) {
+    HINTERNET hSession = WinHttpOpen(L"SysdmAgent/1.0", 
+        WINHTTP_ACCESS_TYPE_NO_PROXY,
+        WINHTTP_NO_PROXY_NAME,
+        WINHTTP_NO_PROXY_BYPASS, 0);
+    
+    if (!hSession) return false;
+
+    HINTERNET hConnect = WinHttpConnect(hSession, host.c_str(), (INTERNET_PORT)port, 0);
+    if (!hConnect) {
+        WinHttpCloseHandle(hSession);
+        return false;
+    }
+
+    std::wstring path = wsPath + L"/frame";
+    
+    HINTERNET hReq = WinHttpOpenRequest(hConnect, L"POST", path.c_str(),
+        NULL, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, 0);
+    
+    if (!hReq) {
+        WinHttpCloseHandle(hConnect);
+        WinHttpCloseHandle(hSession);
+        return false;
+    }
+
+    std::vector<uint8_t> buffer(16 + frame.data.size());
+    *(int*)buffer.data() = frame.width;
+    *(int*)(buffer.data() + 4) = frame.height;
+    *(double*)(buffer.data() + 8) = frame.timestamp;
+    memcpy(buffer.data() + 16, frame.data.data(), frame.data.size());
+
+    BOOL result = WinHttpSendRequest(hReq, 
+        L"Content-Type: application/octet-stream\r\n",
+        (DWORD)-1, buffer.data(), (DWORD)buffer.size(), (DWORD)buffer.size(), 0);
+
+    DWORD statusCode = 0;
+    DWORD statusCodeSize = sizeof(statusCode);
+    if (result) {
+        WinHttpReceiveResponse(hReq, NULL);
+        WinHttpQueryHeaders(hReq, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+            WINHTTP_HEADER_NAME_BY_INDEX, &statusCode, &statusCodeSize, WINHTTP_NO_HEADER_INDEX);
+    }
+
+    WinHttpCloseHandle(hReq);
+    WinHttpCloseHandle(hConnect);
+    WinHttpCloseHandle(hSession);
+
+    Log(L"[HTTP] SendVideoFrameHTTP: %dx%d, status=%d", frame.width, frame.height, statusCode);
+    
+    return result && statusCode == 200;
 }
