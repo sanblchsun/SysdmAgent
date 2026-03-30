@@ -1,26 +1,24 @@
 #include "NetworkManager.h"
-#include <new>
+#include <cstdio>
 
-static void Log(const wchar_t* fmt, ...) {
-    wchar_t buf[1024];
+static void Log(const char* fmt, ...) {
+    char buf[1024];
     va_list args;
     va_start(args, fmt);
-    vswprintf_s(buf, fmt, args);
+    vsprintf_s(buf, fmt, args);
     va_end(args);
-    OutputDebugStringW(buf);
-    wprintf(L"%s\n", buf);
+    OutputDebugStringA(buf);
+    printf("%s\n", buf);
 }
 
 NetworkManager::NetworkManager() : running(false), state(WebSocketState::Disconnected) {
-    InitializeCriticalSection(&cs);
 }
 
 NetworkManager::~NetworkManager() {
     Disconnect();
-    DeleteCriticalSection(&cs);
 }
 
-bool NetworkManager::Connect(const std::wstring& host, int port, const std::wstring& path) {
+bool NetworkManager::Connect(const std::string& host, int port, const std::string& path) {
     this->host = host;
     this->port = port;
     this->wsPath = path;
@@ -30,279 +28,273 @@ bool NetworkManager::Connect(const std::wstring& host, int port, const std::wstr
     }
 
     state = WebSocketState::Connecting;
-    Log(L"[WS] Connecting to %s:%d%s...", host.c_str(), port, path.c_str());
+    Log("[WS] Connecting to %s:%d%s...", host.c_str(), port, path.c_str());
 
-    hSession = WinHttpOpen(L"SysdmAgent/1.0", 
-        WINHTTP_ACCESS_TYPE_NO_PROXY,
-        WINHTTP_NO_PROXY_NAME,
-        WINHTTP_NO_PROXY_BYPASS, 0);
-    
-    if (!hSession) {
-        Log(L"[WS] WinHttpOpen failed: %d", GetLastError());
+    WSADATA wsaData;
+    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
+        Log("[WS] WSAStartup failed");
         state = WebSocketState::Error;
         return false;
     }
 
-    DWORD timeout = 10000;
-    WinHttpSetOption(hSession, WINHTTP_OPTION_CONNECT_TIMEOUT, &timeout, sizeof(timeout));
-
-    hConnect = WinHttpConnect(hSession, host.c_str(), (INTERNET_PORT)port, 0);
-    if (!hConnect) {
-        Log(L"[WS] WinHttpConnect failed: %d", GetLastError());
-        WinHttpCloseHandle(hSession);
-        hSession = nullptr;
+    sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (sock == INVALID_SOCKET) {
+        Log("[WS] socket failed");
         state = WebSocketState::Error;
         return false;
     }
 
-    hRequest = WinHttpOpenRequest(hConnect, L"GET", path.c_str(),
-        NULL, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, 0);
-    
-    if (!hRequest) {
-        Log(L"[WS] WinHttpOpenRequest failed: %d", GetLastError());
-        WinHttpCloseHandle(hConnect);
-        hConnect = nullptr;
-        WinHttpCloseHandle(hSession);
-        hSession = nullptr;
+    struct addrinfo hints, *result = NULL;
+    ZeroMemory(&hints, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_protocol = IPPROTO_TCP;
+
+    char portStr[16];
+    sprintf_s(portStr, "%d", port);
+
+    if (getaddrinfo(host.c_str(), portStr, &hints, &result) != 0) {
+        Log("[WS] getaddrinfo failed");
+        closesocket(sock);
+        sock = INVALID_SOCKET;
         state = WebSocketState::Error;
         return false;
     }
 
-    if (!WinHttpSetOption(hRequest, WINHTTP_OPTION_UPGRADE_TO_WEB_SOCKET, NULL, 0)) {
-        Log(L"[WS] Upgrade failed: %d", GetLastError());
+    if (connect(sock, result->ai_addr, (int)result->ai_addrlen) == SOCKET_ERROR) {
+        Log("[WS] connect failed: %d", WSAGetLastError());
+        freeaddrinfo(result);
+        closesocket(sock);
+        sock = INVALID_SOCKET;
+        state = WebSocketState::Error;
+        return false;
+    }
+    freeaddrinfo(result);
+
+    Log("[WS] TCP connected, performing handshake...");
+
+    std::string handshake = "GET ";
+    handshake += path;
+    handshake += " HTTP/1.1\r\n";
+    handshake += "Host: ";
+    handshake += host;
+    handshake += ":";
+    handshake += std::to_string(port);
+    handshake += "\r\n";
+    handshake += "Upgrade: websocket\r\n";
+    handshake += "Connection: Upgrade\r\n";
+    handshake += "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n";
+    handshake += "Sec-WebSocket-Version: 13\r\n";
+    handshake += "\r\n";
+
+    if (send(sock, handshake.c_str(), (int)handshake.length(), 0) == SOCKET_ERROR) {
+        Log("[WS] handshake send failed: %d", WSAGetLastError());
+        closesocket(sock);
+        sock = INVALID_SOCKET;
         state = WebSocketState::Error;
         return false;
     }
 
-    if (!WinHttpSendRequest(hRequest, NULL, 0, NULL, 0, 0, 0)) {
-        Log(L"[WS] SendRequest failed: %d", GetLastError());
+    char response[1024];
+    int received = recv(sock, response, sizeof(response) - 1, 0);
+    if (received <= 0) {
+        Log("[WS] handshake recv failed");
+        closesocket(sock);
+        sock = INVALID_SOCKET;
+        state = WebSocketState::Error;
+        return false;
+    }
+    response[received] = '\0';
+
+    std::string resp(response);
+    if (resp.find("101") == std::string::npos) {
+        Log("[WS] Expected 101, got: %.*s", received > 100 ? 100 : received, response);
+        closesocket(sock);
+        sock = INVALID_SOCKET;
         state = WebSocketState::Error;
         return false;
     }
 
-    if (!WinHttpReceiveResponse(hRequest, NULL)) {
-        Log(L"[WS] ReceiveResponse failed: %d", GetLastError());
-        state = WebSocketState::Error;
-        return false;
-    }
-
-    DWORD statusCode = 0;
-    DWORD statusCodeSize = sizeof(statusCode);
-    WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-        WINHTTP_HEADER_NAME_BY_INDEX, &statusCode, &statusCodeSize, WINHTTP_NO_HEADER_INDEX);
-
-    Log(L"[WS] HTTP status: %d", statusCode);
-
-    if (statusCode != 101) {
-        Log(L"[WS] WebSocket handshake failed");
-        state = WebSocketState::Error;
-        return false;
-    }
-
-    isWebSocket = true;
     state = WebSocketState::Connected;
     running = true;
-    
-    receiveThread = new (std::nothrow) std::thread(&NetworkManager::ReceiveLoop, this);
-    if (!receiveThread) {
-        Log(L"[WS] Failed to create thread");
-        Disconnect();
-        return false;
-    }
+    receiveThread = std::thread(&NetworkManager::ReceiveLoop, this);
 
-    Log(L"[WS] Connected!");
+    Log("[WS] Connected!");
     if (onStateChange) onStateChange(state);
     return true;
 }
 
 void NetworkManager::ReceiveLoop() {
-    Log(L"[WS] Receive thread started");
-    
-    while (running) {
-        uint8_t buffer[8192];
-        DWORD bytesRead = 0;
-        WINHTTP_WEB_SOCKET_BUFFER_TYPE msgType = WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE;
-        
-        HRESULT hr = WinHttpWebSocketReceive(hRequest, buffer, sizeof(buffer), &bytesRead, &msgType);
-        
-        if (!running) break;
+    Log("[WS] Receive thread started");
 
-        if (FAILED(hr)) {
-            Log(L"[WS] Receive error: 0x%08X", hr);
-            EnterCriticalSection(&cs);
-            state = WebSocketState::Error;
-            LeaveCriticalSection(&cs);
-            if (onStateChange) onStateChange(state);
+    while (running) {
+        fd_set readfds;
+        FD_ZERO(&readfds);
+        FD_SET(sock, &readfds);
+
+        struct timeval tv;
+        tv.tv_sec = 1;
+        tv.tv_usec = 0;
+
+        int sel = select(0, &readfds, NULL, NULL, &tv);
+        if (sel == 0) continue;
+        if (sel < 0) { Log("[WS] select error"); break; }
+
+        uint8_t header[14];
+        int bytes = recv(sock, (char*)header, 2, MSG_PEEK);
+
+        if (bytes <= 0) {
+            if (!running) break;
+            Log("[WS] recv peek failed: %d", WSAGetLastError());
             break;
         }
 
-        if (bytesRead == 0) {
-            if (msgType == WINHTTP_WEB_SOCKET_CLOSE_BUFFER_TYPE) {
-                Log(L"[WS] Server closed connection");
-                break;
-            }
-            continue;
+        uint8_t opcode = header[0] & 0x0F;
+        bool masked = (header[1] & 0x80) != 0;
+        uint64_t payloadLen = header[1] & 0x7F;
+
+        int headerLen = 2;
+        if (payloadLen == 126) headerLen += 2;
+        else if (payloadLen == 127) headerLen += 8;
+
+        std::vector<uint8_t> fullHeader(headerLen + (masked ? 4 : 0));
+        bytes = recv(sock, (char*)fullHeader.data(), headerLen + (masked ? 4 : 0), 0);
+        if (bytes != headerLen + (masked ? 4 : 0)) {
+            Log("[WS] Failed to read full header");
+            break;
         }
 
-        if (msgType == WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE) {
-            EnterCriticalSection(&cs);
-            MessageCallback cb = onMessage;
-            LeaveCriticalSection(&cs);
-            
-            if (cb) {
-                std::string msg((char*)buffer, bytesRead);
-                cb(msg);
+        size_t idx = 2;
+        if (payloadLen == 126) {
+            payloadLen = (fullHeader[idx] << 8) | fullHeader[idx + 1];
+            idx += 2;
+        } else if (payloadLen == 127) {
+            payloadLen = 0;
+            for (int i = 0; i < 8; i++) {
+                payloadLen = (payloadLen << 8) | fullHeader[idx + i];
             }
+            idx += 8;
+        }
+
+        uint8_t maskKey[4] = {0};
+        if (masked) {
+            memcpy(maskKey, &fullHeader[idx], 4);
+            idx += 4;
+        }
+
+        if (payloadLen > 1024 * 1024 * 10) {
+            Log("[WS] Payload too large: %llu", payloadLen);
+            break;
+        }
+
+        std::vector<uint8_t> payload(payloadLen);
+        size_t totalRead = 0;
+        while (totalRead < payloadLen) {
+            bytes = recv(sock, (char*)&payload[totalRead], (int)(payloadLen - totalRead), 0);
+            if (bytes <= 0) break;
+            totalRead += bytes;
+        }
+
+        for (size_t i = 0; i < payloadLen; i++) {
+            payload[i] ^= maskKey[i % 4];
+        }
+
+        if (opcode == 0x8) {
+            Log("[WS] Server closed connection");
+            running = false;
+            break;
+        }
+
+        if (opcode == 0x1 && onMessage) {
+            std::string msg((char*)payload.data(), payload.size());
+            Log("[WS] Received TEXT: %s", msg.c_str());
+            onMessage(msg);
+        } else if (opcode == 0x2) {
+            Log("[WS] Received BINARY: %llu bytes", payloadLen);
         }
     }
-    
-    Log(L"[WS] Receive thread ended");
+
+    state = WebSocketState::Disconnected;
+    if (onStateChange) onStateChange(state);
+    Log("[WS] Receive thread ended");
 }
 
 void NetworkManager::Disconnect() {
-    EnterCriticalSection(&cs);
     running = false;
-    LeaveCriticalSection(&cs);
-    
-    if (hRequest) {
-        if (isWebSocket) {
-            WinHttpWebSocketShutdown(hRequest, 1000, NULL, 0);
-        }
-        WinHttpCloseHandle(hRequest);
-        hRequest = nullptr;
-    }
-    if (hConnect) {
-        WinHttpCloseHandle(hConnect);
-        hConnect = nullptr;
-    }
-    if (hSession) {
-        WinHttpCloseHandle(hSession);
-        hSession = nullptr;
+
+    if (sock != INVALID_SOCKET) {
+        shutdown(sock, SD_BOTH);
+        closesocket(sock);
+        sock = INVALID_SOCKET;
     }
 
-    isWebSocket = false;
-    
-    EnterCriticalSection(&cs);
+    if (receiveThread.joinable()) receiveThread.join();
+
+    WSACleanup();
     state = WebSocketState::Disconnected;
-    LeaveCriticalSection(&cs);
+    if (onStateChange) onStateChange(state);
+    Log("[WS] Disconnected");
+}
 
-    if (receiveThread) {
-        if (receiveThread->joinable()) {
-            receiveThread->join();
+bool NetworkManager::SendFrame(uint8_t opcode, const uint8_t* data, size_t len) {
+    if (sock == INVALID_SOCKET) return false;
+
+    std::vector<uint8_t> frame;
+    frame.push_back(0x80 | opcode);
+
+    if (len < 126) {
+        frame.push_back(0x80 | (uint8_t)len);
+    } else if (len < 65536) {
+        frame.push_back(0x80 | 126);
+        frame.push_back((len >> 8) & 0xFF);
+        frame.push_back(len & 0xFF);
+    } else {
+        frame.push_back(0x80 | 127);
+        for (int i = 7; i >= 0; i--) {
+            frame.push_back((len >> (i * 8)) & 0xFF);
         }
-        delete receiveThread;
-        receiveThread = nullptr;
     }
 
-    if (onStateChange) onStateChange(state);
+    uint8_t mask[4];
+    mask[0] = rand() % 256;
+    mask[1] = rand() % 256;
+    mask[2] = rand() % 256;
+    mask[3] = rand() % 256;
+    frame.insert(frame.end(), mask, mask + 4);
+
+    for (size_t i = 0; i < len; i++) {
+        frame.push_back(data[i] ^ mask[i % 4]);
+    }
+
+    int sent = send(sock, (const char*)frame.data(), (int)frame.size(), 0);
+    if (sent == SOCKET_ERROR) {
+        Log("[WS] SendFrame failed: %d", WSAGetLastError());
+        return false;
+    }
+
+    return true;
 }
 
 bool NetworkManager::SendText(const std::string& message) {
-    EnterCriticalSection(&cs);
-    bool canSend = (state == WebSocketState::Connected && hRequest != nullptr);
-    LeaveCriticalSection(&cs);
-    
-    if (!canSend) {
-        return false;
-    }
-
-    HRESULT hr = WinHttpWebSocketSend(hRequest, WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE, 
-        (PVOID)message.c_str(), (DWORD)message.length());
-    
-    if (FAILED(hr)) {
-        Log(L"[WS] SendText failed: 0x%08X", hr);
-        return false;
-    }
-    
-    return true;
+    if (state != WebSocketState::Connected) return false;
+    return SendFrame(0x1, (const uint8_t*)message.c_str(), message.length());
 }
 
 bool NetworkManager::SendBinary(const uint8_t* data, size_t len) {
-    EnterCriticalSection(&cs);
-    bool canSend = (state == WebSocketState::Connected && hRequest != nullptr);
-    LeaveCriticalSection(&cs);
-    
-    if (!canSend) {
-        Log(L"[WS] SendBinary: not connected");
-        return false;
-    }
-
-    HRESULT hr = WinHttpWebSocketSend(hRequest, WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE, 
-        (PVOID)data, (DWORD)len);
-    
-    if (FAILED(hr)) {
-        Log(L"[WS] SendBinary failed: 0x%08X", hr);
-        return false;
-    }
-    
-    return true;
+    if (state != WebSocketState::Connected) return false;
+    return SendFrame(0x2, data, len);
 }
 
 bool NetworkManager::SendVideoFrame(const VideoFrame& frame) {
     std::vector<uint8_t> buffer(16 + frame.data.size());
-    
+
     *(int*)buffer.data() = frame.width;
     *(int*)(buffer.data() + 4) = frame.height;
     *(double*)(buffer.data() + 8) = frame.timestamp;
     memcpy(buffer.data() + 16, frame.data.data(), frame.data.size());
-    
+
     bool result = SendBinary(buffer.data(), buffer.size());
-    Log(L"[WS] SendVideoFrame: %dx%d, %d bytes, result=%d", frame.width, frame.height, buffer.size(), result);
-    
+    Log("[WS] SendVideoFrame: %dx%d, %d bytes, result=%d", frame.width, frame.height, buffer.size(), result);
+
     return result;
-}
-
-bool NetworkManager::SendVideoFrameHTTP(const VideoFrame& frame) {
-    HINTERNET hSess = WinHttpOpen(L"SysdmAgent/1.0", 
-        WINHTTP_ACCESS_TYPE_NO_PROXY,
-        WINHTTP_NO_PROXY_NAME,
-        WINHTTP_NO_PROXY_BYPASS, 0);
-    
-    if (!hSess) return false;
-
-    HINTERNET hConn = WinHttpConnect(hSess, host.c_str(), (INTERNET_PORT)port, 0);
-    if (!hConn) {
-        WinHttpCloseHandle(hSess);
-        return false;
-    }
-
-    std::wstring path = wsPath + L"/frame";
-    
-    HINTERNET hReq = WinHttpOpenRequest(hConn, L"POST", path.c_str(),
-        NULL, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, 0);
-    
-    if (!hReq) {
-        WinHttpCloseHandle(hConn);
-        WinHttpCloseHandle(hSess);
-        return false;
-    }
-
-    std::vector<uint8_t> buffer(16 + frame.data.size());
-    *(int*)buffer.data() = frame.width;
-    *(int*)(buffer.data() + 4) = frame.height;
-    *(double*)(buffer.data() + 8) = frame.timestamp;
-    memcpy(buffer.data() + 16, frame.data.data(), frame.data.size());
-
-    BOOL sent = WinHttpSendRequest(hReq, 
-        L"Content-Type: application/octet-stream",
-        (DWORD)-1, buffer.data(), (DWORD)buffer.size(), (DWORD)buffer.size(), 0);
-
-    DWORD statusCode = 0;
-    DWORD statusCodeSize = sizeof(statusCode);
-    if (sent) {
-        WinHttpReceiveResponse(hReq, NULL);
-        WinHttpQueryHeaders(hReq, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-            WINHTTP_HEADER_NAME_BY_INDEX, &statusCode, &statusCodeSize, WINHTTP_NO_HEADER_INDEX);
-    }
-
-    WinHttpCloseHandle(hReq);
-    WinHttpCloseHandle(hConn);
-    WinHttpCloseHandle(hSess);
-
-    Log(L"[HTTP] SendVideoFrameHTTP: %dx%d, status=%d", frame.width, frame.height, statusCode);
-    
-    return sent && statusCode == 200;
-}
-
-void NetworkManager::ProcessEvents() {
 }

@@ -6,9 +6,9 @@
 #include <functional>
 #include <vector>
 #include <thread>
-
-#include <winhttp.h>
-#pragma comment(lib, "winhttp.lib")
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#pragma comment(lib, "ws2_32.lib")
 
 enum class WebSocketState {
     Disconnected,
@@ -33,40 +33,34 @@ public:
     NetworkManager();
     ~NetworkManager();
 
-    bool Connect(const std::wstring& host, int port, const std::wstring& path);
+    bool Connect(const std::string& host, int port, const std::string& path);
     void Disconnect();
 
     bool SendText(const std::string& message);
     bool SendBinary(const uint8_t* data, size_t len);
     bool SendVideoFrame(const VideoFrame& frame);
-    bool SendVideoFrameHTTP(const VideoFrame& frame);
 
     void SetMessageCallback(MessageCallback cb) { onMessage = std::move(cb); }
     void SetStateCallback(StateCallback cb) { onStateChange = std::move(cb); }
     void SetVideoCallback(VideoCallback cb) { onVideo = std::move(cb); }
 
-    void ProcessEvents();
     WebSocketState GetState() const { return state; }
 
 private:
     void ReceiveLoop();
+    bool SendFrame(uint8_t opcode, const uint8_t* data, size_t len);
 
-    HINTERNET hSession = nullptr;
-    HINTERNET hConnect = nullptr;
-    HINTERNET hRequest = nullptr;
-    bool isWebSocket = false;
+    SOCKET sock = INVALID_SOCKET;
     bool running = false;
+    std::thread receiveThread;
 
     WebSocketState state = WebSocketState::Disconnected;
-    
-    CRITICAL_SECTION cs;
-    std::thread* receiveThread = nullptr;
 
     MessageCallback onMessage;
     StateCallback onStateChange;
     VideoCallback onVideo;
 
-    std::wstring host;
-    std::wstring wsPath;
+    std::string host;
+    std::string wsPath;
     int port = 0;
 };
