@@ -3,6 +3,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.templating import Jinja2Templates
 import os
+import asyncio
 import logging
 from typing import Dict
 
@@ -51,12 +52,16 @@ async def agent_ws(ws: WebSocket, agent_id: str):
     try:
         while True:
             try:
-                data = await ws.receive()
+                data = await asyncio.wait_for(ws.receive(), timeout=30.0)
+            except asyncio.TimeoutError:
+                logger.info(f"Agent {agent_id} timeout waiting for data")
+                continue
             except Exception as e:
                 logger.error(f"Error receiving from {agent_id}: {e}")
                 break
 
             if data["type"] == "websocket.disconnect":
+                logger.info(f"Agent {agent_id} disconnected by client")
                 break
 
             if data["type"] == "websocket.receive":
@@ -69,12 +74,12 @@ async def agent_ws(ws: WebSocket, agent_id: str):
                         try:
                             await viewer.send_text(text_data)
                         except Exception as e:
-                            logger.error(f"Error sending to viewer: {e}")
+                            logger.error(f"Error sending text to viewer: {e}")
                             viewers.pop(agent_id, None)
                             
                 elif "bytes" in data:
                     bytes_data = data["bytes"]
-                    logger.info(f"Agent {agent_id} binary: {len(bytes_data)} bytes")
+                    logger.info(f"Agent {agent_id} received binary: {len(bytes_data)} bytes")
                     
                     viewer = viewers.get(agent_id)
                     if viewer:
@@ -85,10 +90,10 @@ async def agent_ws(ws: WebSocket, agent_id: str):
                             logger.error(f"Error sending binary to viewer: {e}")
                             viewers.pop(agent_id, None)
                     else:
-                        logger.warning(f"No viewer connected for {agent_id}")
+                        logger.warning(f"No viewer for {agent_id}, dropping frame")
 
     except WebSocketDisconnect:
-        logger.info(f"Agent disconnected: {agent_id}")
+        logger.info(f"Agent {agent_id} WebSocketDisconnect")
     except Exception as e:
         logger.exception(f"Error in agent socket {agent_id}: {e}")
     finally:
@@ -112,12 +117,16 @@ async def viewer_ws(ws: WebSocket, agent_id: str):
     try:
         while True:
             try:
-                data = await ws.receive()
+                data = await asyncio.wait_for(ws.receive(), timeout=60.0)
+            except asyncio.TimeoutError:
+                logger.info(f"Viewer {agent_id} timeout")
+                continue
             except Exception as e:
                 logger.error(f"Error receiving from viewer {agent_id}: {e}")
                 break
 
             if data["type"] == "websocket.disconnect":
+                logger.info(f"Viewer {agent_id} disconnected by client")
                 break
 
             if data["type"] == "websocket.receive":
@@ -133,7 +142,7 @@ async def viewer_ws(ws: WebSocket, agent_id: str):
                             logger.error(f"Error sending to agent: {e}")
 
     except WebSocketDisconnect:
-        logger.info(f"Viewer disconnected for {agent_id}")
+        logger.info(f"Viewer {agent_id} WebSocketDisconnect")
     except Exception as e:
         logger.exception(f"Error in viewer socket {agent_id}: {e}")
     finally:

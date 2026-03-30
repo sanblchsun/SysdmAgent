@@ -4,18 +4,21 @@
 #include <dxgi.h>
 #include <dxgi1_2.h>
 #include <d3d11.h>
+#include <gdiplus.h>
 
 #include "NetworkManager.h"
 
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dxgi.lib")
 #pragma comment(lib, "winhttp.lib")
+#pragma comment(lib, "gdiplus.lib")
 
 #define SERVER_HOST L"192.168.88.127"
 #define SERVER_PORT 8000
 #define AGENT_ID L"agent1"
 
 #define VIDEO_FPS 5
+#define JPEG_QUALITY 70
 
 static void Log(const wchar_t* fmt, ...) {
     wchar_t buf[1024];
@@ -27,8 +30,97 @@ static void Log(const wchar_t* fmt, ...) {
     wprintf(L"%s\n", buf);
 }
 
+class JpegEncoder {
+public:
+    JpegEncoder() : gdiplusToken(0) {
+        Gdiplus::GdiplusStartupInput input;
+        Gdiplus::GdiplusStartup(&gdiplusToken, &input, NULL);
+    }
+    
+    ~JpegEncoder() {
+        Gdiplus::GdiplusShutdown(gdiplusToken);
+    }
+    
+    bool Encode(const uint8_t* rgb, int width, int height, std::vector<uint8_t>& jpegOut) {
+        using namespace Gdiplus;
+        
+        Bitmap bitmap(width, height, PixelFormat24bppRGB);
+        
+        for (int y = 0; y < height; y++) {
+            for (int x = 0; x < width; x++) {
+                int idx = (y * width + x) * 3;
+                Color c(rgb[idx], rgb[idx + 1], rgb[idx + 2]);
+                bitmap.SetPixel(x, y, c);
+            }
+        }
+        
+        IStream* stream = NULL;
+        if (CreateStreamOnHGlobal(NULL, TRUE, &stream) != S_OK) {
+            return false;
+        }
+        
+        CLSID jpgClsid;
+        GetEncoderClsid(L"image/jpeg", &jpgClsid);
+        
+        EncoderParameters params;
+        params.Count = 1;
+        params.Parameter[0].Guid = EncoderQuality;
+        params.Parameter[0].Type = EncoderParameterValueTypeLong;
+        params.Parameter[0].NumberOfValues = 1;
+        params.Parameter[0].Value = &JPEG_QUALITY;
+        
+        Status st = bitmap.Save(stream, &jpgClsid, &params);
+        stream->Release();
+        
+        if (st != Ok) {
+            return false;
+        }
+        
+        HGLOBAL hGlobal = NULL;
+        stream->GetHGlobal(&hGlobal);
+        if (!hGlobal) return false;
+        
+        SIZE_T size = GlobalSize(hGlobal);
+        void* data = GlobalLock(hGlobal);
+        if (data) {
+            jpegOut.assign((uint8_t*)data, (uint8_t*)data + size);
+            GlobalUnlock(hGlobal);
+        }
+        
+        return !jpegOut.empty();
+    }
+    
+private:
+    ULONG_PTR gdiplusToken;
+    
+    int GetEncoderClsid(const WCHAR* format, CLSID* pClsid) {
+        using namespace Gdiplus;
+        UINT num = 0, size = 0;
+        GetImageEncodersSize(&num, &size);
+        if (size == 0) return -1;
+        
+        ImageCodecInfo* pImageCodecInfo = (ImageCodecInfo*)(malloc(size));
+        if (!pImageCodecInfo) return -1;
+        
+        GetImageEncoders(num, size, pImageCodecInfo);
+        
+        for (UINT i = 0; i < num; i++) {
+            if (wcscmp(pImageCodecInfo[i].MimeType, format) == 0) {
+                *pClsid = pImageCodecInfo[i].Clsid;
+                free(pImageCodecInfo);
+                return i;
+            }
+        }
+        
+        free(pImageCodecInfo);
+        return -1;
+    }
+};
+
 int main() {
     wprintf(L"=== SysdmAgent Starting ===\n");
+
+    JpegEncoder encoder;
 
     HDESK hDesk = OpenInputDesktop(0, FALSE, GENERIC_ALL);
     if (!hDesk) {
@@ -71,6 +163,8 @@ int main() {
         return 1;
     }
 
+    ID3D11Texture2D* stagingTex = nullptr;
+
     NetworkManager network;
     std::wstring wsPath = std::wstring(L"/ws/agent/") + AGENT_ID;
     
@@ -108,6 +202,8 @@ int main() {
     int frameCount = 0;
     int64_t lastFrameTime = 0;
     int64_t frameInterval = 1000 / VIDEO_FPS;
+    int captureWidth = 0;
+    int captureHeight = 0;
 
     wprintf(L"Starting capture loop (%d FPS)...\n", VIDEO_FPS);
 
@@ -136,6 +232,13 @@ int main() {
             output->Release();
             output1->DuplicateOutput(device, &dup);
             output1->Release();
+            
+            if (stagingTex) {
+                stagingTex->Release();
+                stagingTex = nullptr;
+            }
+            captureWidth = 0;
+            captureHeight = 0;
             continue;
         }
         
@@ -155,17 +258,47 @@ int main() {
                 D3D11_TEXTURE2D_DESC desc;
                 tex->GetDesc(&desc);
                 
+                if (captureWidth != desc.Width || captureHeight != desc.Height) {
+                    wprintf(L"New size: %dx%d\n", desc.Width, desc.Height);
+                    captureWidth = desc.Width;
+                    captureHeight = desc.Height;
+                    
+                    if (stagingTex) {
+                        stagingTex->Release();
+                    }
+                    
+                    D3D11_TEXTURE2D_DESC stagingDesc = {};
+                    stagingDesc.Width = desc.Width;
+                    stagingDesc.Height = desc.Height;
+                    stagingDesc.MipLevels = 1;
+                    stagingDesc.ArraySize = 1;
+                    stagingDesc.Format = desc.Format;
+                    stagingDesc.SampleDesc = { 1, 0 };
+                    stagingDesc.Usage = D3D11_USAGE_STAGING;
+                    stagingDesc.BindFlags = 0;
+                    stagingDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+                    
+                    hr = device->CreateTexture2D(&stagingDesc, nullptr, &stagingTex);
+                    if (FAILED(hr)) {
+                        wprintf(L"Failed to create staging texture: 0x%08X\n", hr);
+                        tex->Release();
+                        continue;
+                    }
+                }
+                
+                ctx->CopyResource(stagingTex, tex);
+                
                 int64_t elapsed = (lastFrameTime == 0) ? 9999 : (now - lastFrameTime);
                 bool shouldSend = elapsed >= frameInterval;
                 
-                if (frameCount <= 5) {
-                    wprintf(L"[%lld] Frame #%d: %dx%d, elapsed=%lld, interval=%lld, send=%d\n", 
-                        now, frameCount, desc.Width, desc.Height, elapsed, frameInterval, shouldSend);
+                if (frameCount <= 3) {
+                    wprintf(L"Frame #%d: %dx%d, elapsed=%lld, send=%d\n", 
+                        frameCount, desc.Width, desc.Height, elapsed, shouldSend);
                 }
 
                 if (shouldSend) {
                     D3D11_MAPPED_SUBRESOURCE mapped;
-                    hr = ctx->Map(tex, 0, D3D11_MAP_READ, 0, &mapped);
+                    hr = ctx->Map(stagingTex, 0, D3D11_MAP_READ, 0, &mapped);
                     
                     if (FAILED(hr)) {
                         wprintf(L"  Map FAILED: 0x%08X\n", hr);
@@ -186,17 +319,21 @@ int main() {
                             }
                         }
                         
-                        ctx->Unmap(tex, 0);
+                        ctx->Unmap(stagingTex, 0);
                         
-                        VideoFrame frame;
-                        frame.width = desc.Width;
-                        frame.height = desc.Height;
-                        frame.timestamp = (double)now / 1000.0;
-                        frame.data = rgbData;
-                        
-                        wprintf(L"  Sending %d bytes...\n", frame.data.size());
-                        bool sent = network.SendVideoFrame(frame);
-                        wprintf(L"  Result: %s\n", sent ? L"SENT!" : L"FAILED!");
+                        std::vector<uint8_t> jpegData;
+                        if (encoder.Encode(rgbData.data(), desc.Width, desc.Height, jpegData)) {
+                            VideoFrame frame;
+                            frame.width = desc.Width;
+                            frame.height = desc.Height;
+                            frame.timestamp = (double)now / 1000.0;
+                            frame.data = jpegData;
+                            
+                            bool sent = network.SendVideoFrame(frame);
+                            if (frameCount <= 3) {
+                                wprintf(L"  JPEG: %d bytes, sent=%d\n", jpegData.size(), sent);
+                            }
+                        }
                         
                         lastFrameTime = now;
                     }
@@ -210,6 +347,7 @@ int main() {
     }
 
     network.Disconnect();
+    if (stagingTex) stagingTex->Release();
     dup->Release();
     ctx->Release();
     device->Release();
