@@ -53,13 +53,13 @@ async def agent_ws(ws: WebSocket, agent_id: str):
     try:
         while True:
             try:
-                logger.info(f"Agent {agent_id}: calling receive()...")
-                raw = await ws._ws.accepted
-                data = await ws.receive()
-                logger.info(f"Agent {agent_id}: received data type={data.get('type')}, keys={list(data.keys())}")
-            except Exception as e:
-                logger.error(f"Agent {agent_id}: receive error: {e}")
-                break
+                data = await asyncio.wait_for(ws.receive(), timeout=5.0)
+            except asyncio.TimeoutError:
+                logger.debug(f"Agent {agent_id}: timeout, sending ping")
+                await ws.send_text("ping")
+                continue
+                
+            logger.info(f"Agent {agent_id}: type={data.get('type')}")
 
             if data["type"] == "websocket.disconnect":
                 logger.info(f"Agent {agent_id}: disconnected")
@@ -68,13 +68,10 @@ async def agent_ws(ws: WebSocket, agent_id: str):
             if data["type"] == "websocket.receive":
                 if "text" in data:
                     text_data = data["text"]
-                    logger.info(f"Agent {agent_id}: TEXT [{len(text_data)} bytes]: {text_data[:50]}")
+                    logger.info(f"Agent {agent_id}: TEXT [{len(text_data)} bytes]")
                     viewer = viewers.get(agent_id)
                     if viewer:
                         await viewer.send_text(text_data)
-                        logger.info(f"Forwarded to viewer")
-                    else:
-                        logger.warning(f"No viewer connected")
                         
                 elif "bytes" in data:
                     bytes_data = data["bytes"]
@@ -82,9 +79,8 @@ async def agent_ws(ws: WebSocket, agent_id: str):
                     viewer = viewers.get(agent_id)
                     if viewer:
                         await viewer.send_bytes(bytes_data)
-                        logger.info(f"Forwarded {len(bytes_data)} bytes to viewer")
                     else:
-                        logger.warning(f"No viewer connected, dropped {len(bytes_data)} bytes")
+                        logger.warning(f"No viewer, dropped {len(bytes_data)} bytes")
 
     except WebSocketDisconnect:
         logger.info(f"Agent {agent_id}: WebSocketDisconnect")
@@ -111,12 +107,8 @@ async def viewer_ws(ws: WebSocket, agent_id: str):
 
     try:
         while True:
-            try:
-                data = await ws.receive()
-            except Exception as e:
-                logger.error(f"Viewer {agent_id}: receive error: {e}")
-                break
-
+            data = await ws.receive()
+            
             if data["type"] == "websocket.disconnect":
                 break
 

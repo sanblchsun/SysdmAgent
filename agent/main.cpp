@@ -77,7 +77,7 @@ public:
         params.Parameter[0].Guid = EncoderQuality;
         params.Parameter[0].Type = EncoderParameterValueTypeLong;
         params.Parameter[0].NumberOfValues = 1;
-        ULONG quality = JPEG_QUALITY;
+        ULONG quality = 70;
         params.Parameter[0].Value = &quality;
         
         Status st = bitmap.Save(stream, &jpgClsid, &params);
