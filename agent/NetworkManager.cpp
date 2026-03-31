@@ -11,7 +11,7 @@ static void Log(const char* fmt, ...) {
     printf("%s\n", buf);
 }
 
-NetworkManager::NetworkManager() : running(false), state(WebSocketState::Disconnected) {
+NetworkManager::NetworkManager() {
 }
 
 NetworkManager::~NetworkManager() {
@@ -19,28 +19,28 @@ NetworkManager::~NetworkManager() {
 }
 
 bool NetworkManager::Connect(const std::string& host, int port, const std::string& path) {
-    this->host = host;
-    this->port = port;
-    this->wsPath = path;
-
-    if (state == WebSocketState::Connected || state == WebSocketState::Connecting) {
+    if (state == ConnectionState::Connected || state == ConnectionState::Connecting) {
         Disconnect();
     }
 
-    state = WebSocketState::Connecting;
+    this->host = host;
+    this->port = port;
+    this->path = path;
+
+    state = ConnectionState::Connecting;
     Log("[WS] Connecting to %s:%d%s...", host.c_str(), port, path.c_str());
 
     WSADATA wsaData;
     if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
         Log("[WS] WSAStartup failed");
-        state = WebSocketState::Error;
+        state = ConnectionState::Error;
         return false;
     }
 
     sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (sock == INVALID_SOCKET) {
         Log("[WS] socket failed");
-        state = WebSocketState::Error;
+        state = ConnectionState::Error;
         return false;
     }
 
@@ -57,7 +57,7 @@ bool NetworkManager::Connect(const std::string& host, int port, const std::strin
         Log("[WS] getaddrinfo failed");
         closesocket(sock);
         sock = INVALID_SOCKET;
-        state = WebSocketState::Error;
+        state = ConnectionState::Error;
         return false;
     }
 
@@ -66,12 +66,10 @@ bool NetworkManager::Connect(const std::string& host, int port, const std::strin
         freeaddrinfo(result);
         closesocket(sock);
         sock = INVALID_SOCKET;
-        state = WebSocketState::Error;
+        state = ConnectionState::Error;
         return false;
     }
     freeaddrinfo(result);
-
-    Log("[WS] TCP connected, performing handshake...");
 
     std::string handshake = "GET ";
     handshake += path;
@@ -91,7 +89,7 @@ bool NetworkManager::Connect(const std::string& host, int port, const std::strin
         Log("[WS] handshake send failed: %d", WSAGetLastError());
         closesocket(sock);
         sock = INVALID_SOCKET;
-        state = WebSocketState::Error;
+        state = ConnectionState::Error;
         return false;
     }
 
@@ -101,7 +99,7 @@ bool NetworkManager::Connect(const std::string& host, int port, const std::strin
         Log("[WS] handshake recv failed");
         closesocket(sock);
         sock = INVALID_SOCKET;
-        state = WebSocketState::Error;
+        state = ConnectionState::Error;
         return false;
     }
     response[received] = '\0';
@@ -111,11 +109,11 @@ bool NetworkManager::Connect(const std::string& host, int port, const std::strin
         Log("[WS] Expected 101, got: %.*s", received > 100 ? 100 : received, response);
         closesocket(sock);
         sock = INVALID_SOCKET;
-        state = WebSocketState::Error;
+        state = ConnectionState::Error;
         return false;
     }
 
-    state = WebSocketState::Connected;
+    state = ConnectionState::Connected;
     running = true;
     receiveThread = std::thread(&NetworkManager::ReceiveLoop, this);
 
@@ -125,8 +123,6 @@ bool NetworkManager::Connect(const std::string& host, int port, const std::strin
 }
 
 void NetworkManager::ReceiveLoop() {
-    Log("[WS] Receive thread started");
-
     while (running) {
         fd_set readfds;
         FD_ZERO(&readfds);
@@ -138,14 +134,13 @@ void NetworkManager::ReceiveLoop() {
 
         int sel = select(0, &readfds, NULL, NULL, &tv);
         if (sel == 0) continue;
-        if (sel < 0) { Log("[WS] select error"); break; }
+        if (sel < 0) break;
 
         uint8_t header[14];
         int bytes = recv(sock, (char*)header, 2, MSG_PEEK);
 
         if (bytes <= 0) {
             if (!running) break;
-            Log("[WS] recv peek failed: %d", WSAGetLastError());
             break;
         }
 
@@ -159,10 +154,7 @@ void NetworkManager::ReceiveLoop() {
 
         std::vector<uint8_t> fullHeader(headerLen + (masked ? 4 : 0));
         bytes = recv(sock, (char*)fullHeader.data(), headerLen + (masked ? 4 : 0), 0);
-        if (bytes != headerLen + (masked ? 4 : 0)) {
-            Log("[WS] Failed to read full header");
-            break;
-        }
+        if (bytes != headerLen + (masked ? 4 : 0)) break;
 
         size_t idx = 2;
         if (payloadLen == 126) {
@@ -179,13 +171,9 @@ void NetworkManager::ReceiveLoop() {
         uint8_t maskKey[4] = {0};
         if (masked) {
             memcpy(maskKey, &fullHeader[idx], 4);
-            idx += 4;
         }
 
-        if (payloadLen > 1024 * 1024 * 10) {
-            Log("[WS] Payload too large: %llu", payloadLen);
-            break;
-        }
+        if (payloadLen > 1024 * 1024 * 10) break;
 
         std::vector<uint8_t> payload(payloadLen);
         size_t totalRead = 0;
@@ -200,23 +188,18 @@ void NetworkManager::ReceiveLoop() {
         }
 
         if (opcode == 0x8) {
-            Log("[WS] Server closed connection");
             running = false;
             break;
         }
 
         if (opcode == 0x1 && onMessage) {
             std::string msg((char*)payload.data(), payload.size());
-            Log("[WS] Received TEXT: %s", msg.c_str());
             onMessage(msg);
-        } else if (opcode == 0x2) {
-            Log("[WS] Received BINARY: %llu bytes", payloadLen);
         }
     }
 
-    state = WebSocketState::Disconnected;
+    state = ConnectionState::Disconnected;
     if (onStateChange) onStateChange(state);
-    Log("[WS] Receive thread ended");
 }
 
 void NetworkManager::Disconnect() {
@@ -231,9 +214,8 @@ void NetworkManager::Disconnect() {
     if (receiveThread.joinable()) receiveThread.join();
 
     WSACleanup();
-    state = WebSocketState::Disconnected;
+    state = ConnectionState::Disconnected;
     if (onStateChange) onStateChange(state);
-    Log("[WS] Disconnected");
 }
 
 bool NetworkManager::SendFrame(uint8_t opcode, const uint8_t* data, size_t len) {
@@ -268,7 +250,6 @@ bool NetworkManager::SendFrame(uint8_t opcode, const uint8_t* data, size_t len) 
 
     int sent = send(sock, (const char*)frame.data(), (int)frame.size(), 0);
     if (sent == SOCKET_ERROR) {
-        Log("[WS] SendFrame failed: %d", WSAGetLastError());
         return false;
     }
 
@@ -276,25 +257,27 @@ bool NetworkManager::SendFrame(uint8_t opcode, const uint8_t* data, size_t len) 
 }
 
 bool NetworkManager::SendText(const std::string& message) {
-    if (state != WebSocketState::Connected) return false;
+    if (state != ConnectionState::Connected) return false;
     return SendFrame(0x1, (const uint8_t*)message.c_str(), message.length());
 }
 
 bool NetworkManager::SendBinary(const uint8_t* data, size_t len) {
-    if (state != WebSocketState::Connected) return false;
+    if (state != ConnectionState::Connected) return false;
     return SendFrame(0x2, data, len);
 }
 
-bool NetworkManager::SendVideoFrame(const VideoFrame& frame) {
-    std::vector<uint8_t> buffer(16 + frame.data.size());
+ConnectionState NetworkManager::GetState() const {
+    return state;
+}
 
-    *(int*)buffer.data() = frame.width;
-    *(int*)(buffer.data() + 4) = frame.height;
-    *(double*)(buffer.data() + 8) = frame.timestamp;
-    memcpy(buffer.data() + 16, frame.data.data(), frame.data.size());
+bool NetworkManager::IsConnected() const {
+    return state == ConnectionState::Connected;
+}
 
-    bool result = SendBinary(buffer.data(), buffer.size());
-    Log("[WS] SendVideoFrame: %dx%d, %d bytes, result=%d", frame.width, frame.height, buffer.size(), result);
+void NetworkManager::SetMessageCallback(MessageCallback cb) {
+    onMessage = std::move(cb);
+}
 
-    return result;
+void NetworkManager::SetStateCallback(StateCallback cb) {
+    onStateChange = std::move(cb);
 }

@@ -3,32 +3,24 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <string>
-#include <functional>
 #include <vector>
+#include <functional>
 #include <thread>
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #pragma comment(lib, "ws2_32.lib")
 
-enum class WebSocketState {
+enum class ConnectionState {
     Disconnected,
     Connecting,
     Connected,
     Error
 };
 
-struct VideoFrame {
-    int width;
-    int height;
-    std::vector<uint8_t> data;
-    double timestamp;
-};
-
 class NetworkManager {
 public:
     using MessageCallback = std::function<void(const std::string& message)>;
-    using StateCallback = std::function<void(WebSocketState state)>;
-    using VideoCallback = std::function<void(const VideoFrame& frame)>;
+    using StateCallback = std::function<void(ConnectionState state)>;
 
     NetworkManager();
     ~NetworkManager();
@@ -38,13 +30,12 @@ public:
 
     bool SendText(const std::string& message);
     bool SendBinary(const uint8_t* data, size_t len);
-    bool SendVideoFrame(const VideoFrame& frame);
 
-    void SetMessageCallback(MessageCallback cb) { onMessage = std::move(cb); }
-    void SetStateCallback(StateCallback cb) { onStateChange = std::move(cb); }
-    void SetVideoCallback(VideoCallback cb) { onVideo = std::move(cb); }
+    void SetMessageCallback(MessageCallback cb);
+    void SetStateCallback(StateCallback cb);
 
-    WebSocketState GetState() const { return state; }
+    ConnectionState GetState() const;
+    bool IsConnected() const;
 
 private:
     void ReceiveLoop();
@@ -54,13 +45,12 @@ private:
     bool running = false;
     std::thread receiveThread;
 
-    WebSocketState state = WebSocketState::Disconnected;
+    ConnectionState state = ConnectionState::Disconnected;
 
     MessageCallback onMessage;
     StateCallback onStateChange;
-    VideoCallback onVideo;
 
     std::string host;
-    std::string wsPath;
+    std::string path;
     int port = 0;
 };
