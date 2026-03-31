@@ -18,6 +18,15 @@ NetworkManager::~NetworkManager() {
     Disconnect();
 }
 
+void NetworkManager::SetReconnectParams(int maxRetries, int retryDelayMs) {
+    this->maxRetries = maxRetries;
+    this->retryDelayMs = retryDelayMs;
+}
+
+void NetworkManager::SetReconnectCallback(ReconnectCallback cb) {
+    onReconnect = std::move(cb);
+}
+
 bool NetworkManager::Connect(const std::string& host, int port, const std::string& path) {
     if (state == ConnectionState::Connected || state == ConnectionState::Connecting) {
         Disconnect();
@@ -27,13 +36,18 @@ bool NetworkManager::Connect(const std::string& host, int port, const std::strin
     this->port = port;
     this->path = path;
 
+    return DoConnect();
+}
+
+bool NetworkManager::DoConnect() {
     state = ConnectionState::Connecting;
-    Log("[WS] Connecting to %s:%d%s...", host.c_str(), port, path.c_str());
+    if (onStateChange) onStateChange(state);
 
     WSADATA wsaData;
     if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
         Log("[WS] WSAStartup failed");
         state = ConnectionState::Error;
+        if (onStateChange) onStateChange(state);
         return false;
     }
 
@@ -41,6 +55,7 @@ bool NetworkManager::Connect(const std::string& host, int port, const std::strin
     if (sock == INVALID_SOCKET) {
         Log("[WS] socket failed");
         state = ConnectionState::Error;
+        if (onStateChange) onStateChange(state);
         return false;
     }
 
@@ -58,6 +73,7 @@ bool NetworkManager::Connect(const std::string& host, int port, const std::strin
         closesocket(sock);
         sock = INVALID_SOCKET;
         state = ConnectionState::Error;
+        if (onStateChange) onStateChange(state);
         return false;
     }
 
@@ -67,6 +83,7 @@ bool NetworkManager::Connect(const std::string& host, int port, const std::strin
         closesocket(sock);
         sock = INVALID_SOCKET;
         state = ConnectionState::Error;
+        if (onStateChange) onStateChange(state);
         return false;
     }
     freeaddrinfo(result);
@@ -90,6 +107,7 @@ bool NetworkManager::Connect(const std::string& host, int port, const std::strin
         closesocket(sock);
         sock = INVALID_SOCKET;
         state = ConnectionState::Error;
+        if (onStateChange) onStateChange(state);
         return false;
     }
 
@@ -100,6 +118,7 @@ bool NetworkManager::Connect(const std::string& host, int port, const std::strin
         closesocket(sock);
         sock = INVALID_SOCKET;
         state = ConnectionState::Error;
+        if (onStateChange) onStateChange(state);
         return false;
     }
     response[received] = '\0';
@@ -110,11 +129,12 @@ bool NetworkManager::Connect(const std::string& host, int port, const std::strin
         closesocket(sock);
         sock = INVALID_SOCKET;
         state = ConnectionState::Error;
+        if (onStateChange) onStateChange(state);
         return false;
     }
 
-    state = ConnectionState::Connected;
     running = true;
+    state = ConnectionState::Connected;
     receiveThread = std::thread(&NetworkManager::ReceiveLoop, this);
 
     Log("[WS] Connected!");
@@ -192,17 +212,62 @@ void NetworkManager::ReceiveLoop() {
             break;
         }
 
-        if (opcode == 0x1 && onMessage) {
+        if (opcode == 0x9) {
+            SendFrame(0xA, payload.data(), payload.size());
+        } else if (opcode == 0x1 && onMessage) {
             std::string msg((char*)payload.data(), payload.size());
             onMessage(msg);
         }
     }
 
+    if (sock != INVALID_SOCKET) {
+        closesocket(sock);
+        sock = INVALID_SOCKET;
+    }
+    WSACleanup();
+
     state = ConnectionState::Disconnected;
     if (onStateChange) onStateChange(state);
+
+    if (running && autoReconnect) {
+        reconnectThread = std::thread(&NetworkManager::ReconnectLoop, this);
+    }
+}
+
+void NetworkManager::ReconnectLoop() {
+    reconnectAttempt = 0;
+
+    while (running && autoReconnect) {
+        if (maxRetries > 0 && reconnectAttempt >= maxRetries) {
+            Log("[WS] Max retries (%d) reached, giving up", maxRetries);
+            state = ConnectionState::Error;
+            if (onStateChange) onStateChange(state);
+            return;
+        }
+
+        reconnectAttempt++;
+        int attempt = reconnectAttempt.load();
+        Log("[WS] Reconnecting in %d ms... (attempt %d/%d)",
+            retryDelayMs, attempt, maxRetries > 0 ? maxRetries : -1);
+
+        if (onReconnect) onReconnect(attempt);
+
+        Sleep(retryDelayMs);
+
+        if (!running || !autoReconnect) break;
+
+        if (DoConnect()) {
+            Log("[WS] Reconnected successfully on attempt %d", attempt);
+            reconnectAttempt = 0;
+            return;
+        }
+
+        Log("[WS] Reconnect attempt %d failed", attempt);
+    }
 }
 
 void NetworkManager::Disconnect() {
+    autoReconnect = false;
     running = false;
 
     if (sock != INVALID_SOCKET) {
@@ -212,9 +277,11 @@ void NetworkManager::Disconnect() {
     }
 
     if (receiveThread.joinable()) receiveThread.join();
+    if (reconnectThread.joinable()) reconnectThread.join();
 
     WSACleanup();
     state = ConnectionState::Disconnected;
+    reconnectAttempt = 0;
     if (onStateChange) onStateChange(state);
 }
 
@@ -264,6 +331,11 @@ bool NetworkManager::SendText(const std::string& message) {
 bool NetworkManager::SendBinary(const uint8_t* data, size_t len) {
     if (state != ConnectionState::Connected) return false;
     return SendFrame(0x2, data, len);
+}
+
+bool NetworkManager::SendPing() {
+    if (state != ConnectionState::Connected) return false;
+    return SendFrame(0x9, NULL, 0);
 }
 
 ConnectionState NetworkManager::GetState() const {

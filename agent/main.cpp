@@ -116,6 +116,8 @@ int main() {
     printf("=== Screen Capture WebSocket Agent ===\n");
     
     NetworkManager net;
+    net.SetReconnectParams(0, 5000);
+    
     net.SetMessageCallback([](const std::string& msg) { 
         printf("[MSG] %s\n", msg.c_str()); 
     });
@@ -128,6 +130,9 @@ int main() {
             case ConnectionState::Error: stateStr = "Error"; break;
         }
         printf("[STATE] %s\n", stateStr);
+    });
+    net.SetReconnectCallback([](int attempt) {
+        printf("[RECONNECT] Attempt #%d\n", attempt);
     });
     
     char wsPath[256];
@@ -145,6 +150,7 @@ int main() {
     int frameCount = 0;
     int totalBytes = 0;
     auto startTime = std::chrono::steady_clock::now();
+    auto lastPingTime = startTime;
     
     while (net.IsConnected()) {
         std::vector<uint8_t> jpegData = capturer.CaptureFrame();
@@ -153,15 +159,21 @@ int main() {
             frameCount++;
             totalBytes += (int)jpegData.size();
             printf("[Frame #%d] Sent %d bytes\n", frameCount, (int)jpegData.size());
-        } else {
-            break;
         }
         
         std::this_thread::sleep_for(std::chrono::milliseconds(1000 / TARGET_FPS));
         
         auto now = std::chrono::steady_clock::now();
-        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - startTime).count();
-        if (elapsed >= 30) break;
+        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - lastPingTime).count();
+        if (elapsed >= 10) {
+            if (net.SendPing()) {
+                printf("[PING] Sent\n");
+            }
+            lastPingTime = now;
+        }
+        
+        //auto totalElapsed = std::chrono::duration_cast<std::chrono::seconds>(now - startTime).count();
+        //if (totalElapsed >= 60) break;
     }
     
     auto endTime = std::chrono::steady_clock::now();
